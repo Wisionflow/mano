@@ -20,6 +20,7 @@ from src.document_processor import process_file, SUPPORTED_EXTENSIONS
 from src.vector_store import VectorStore
 from src.medical_agent import MedicalAgent
 from src.health_diary import is_health_status, save_entry, load_entries, format_entries
+from src.emergency_card import EMERGENCY_CARD, HOSPITAL_CARD
 
 load_dotenv()
 logging.basicConfig(
@@ -64,10 +65,13 @@ WELCOME_TEXT = (
     "Можно писать текстом или отправить голосовое сообщение.\n"
     "Документы (PDF, фото, Excel) — добавлю в базу знаний.\n\n"
     "Команды:\n"
+    "/sos — экстренная карточка для скорой\n"
+    "/hospital — сводка для приёмного отделения\n"
     "/doctor — подготовить речь для врача\n"
     "/diary — дневник самочувствия\n"
     "/files — список документов в базе\n"
     "/clear — очистить историю диалога\n\n"
+    "Фото рецепта/назначения — автоматически проверю безопасность.\n\n"
     "⚠️ Я не ставлю диагнозы и не заменяю врача."
 )
 
@@ -109,6 +113,37 @@ DOCTOR_VISIT_PROMPT = """Пациентка идёт на приём к врач
 - Укладывается в 1-2 минуты устной речи (не больше 1000 символов)
 - НИКАКИХ советов, поддержки, мотивации, "что спросить"
 - НИКАКОЙ самодиагностики и интерпретации результатов — только факты и одна просьба"""
+
+
+# Prescription/procedure verification prompt
+PRESCRIPTION_CHECK_PROMPT = """Пациентка прислала фото рецепта или медицинского назначения.
+Распознанный текст ниже.
+
+ЗАДАЧА: Проверь КАЖДЫЙ препарат и процедуру из этого назначения на безопасность
+для ЭТОЙ КОНКРЕТНОЙ пациентки. Используй МЕДИЦИНСКУЮ СВОДКУ.
+
+Проверяй:
+1. Есть ли препарат в списке запрещённых/аллергий?
+2. Совместимость с текущими лекарствами (дулоксетин, габапентин, холекальциферол, канефрон)
+3. Нагрузка на ЕДИНСТВЕННУЮ почку при рСКФ 32
+4. Нагрузка на печень (АЛТ 48)
+5. Взаимодействия с диагнозами (ХБП, ГЭРБ, остеопороз, тревожное расстройство)
+
+ОСОБОЕ ВНИМАНИЕ:
+- РЕНТГЕНКОНТРАСТ — ЗАПРЕЩЁН (единственная почка, рСКФ 32). Недавно делали КТ с контрастом → неделю не вставала с кровати.
+- НПВС — ЗАПРЕЩЕНЫ все
+- Любые нефротоксичные препараты
+
+ФОРМАТ ОТВЕТА:
+Для каждого найденного препарата/процедуры:
+- Название: что это
+- Вердикт: ✅ безопасно / ⚠️ осторожно / 🚫 ОПАСНО
+- Почему (1 предложение)
+
+Если нашёл что-то опасное — скажи ПРЯМО и ГРОМКО. Лучше перебдеть.
+
+РАСПОЗНАННЫЙ ТЕКСТ:
+{text}"""
 
 
 # --- Access control ---
@@ -216,6 +251,26 @@ async def cmd_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries = load_entries(last_n=n)
     text = format_entries(entries)
 
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
+    else:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i : i + 4096])
+
+
+async def cmd_sos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sos — instant emergency card for paramedics."""
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(EMERGENCY_CARD)
+
+
+async def cmd_hospital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /hospital — full summary for ER admission."""
+    if not is_allowed(update.effective_user.id):
+        return
+    # Hospital card is longer, may need splitting
+    text = HOSPITAL_CARD
     if len(text) <= 4096:
         await update.message.reply_text(text)
     else:
@@ -378,7 +433,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo uploads — OCR and ingest."""
+    """Handle photo uploads — OCR, ingest, and auto-check prescriptions."""
     if not is_allowed(update.effective_user.id):
         return
 
@@ -409,6 +464,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Фото обработано: {chunks} фрагментов ({result['char_count']} символов).\n\n"
             f"Распознанный текст:\n{preview}"
         )
+
+        # Auto-check for prescriptions/procedures in the recognized text
+        text_lower = result["text"].lower()
+        med_markers = [
+            "рецепт", "назначен", "принимать", "таблет", "капсул", "мг ", "мл ",
+            "раз в день", "р/д", "курс", "направлен", "исследован", "контраст",
+            "рентген", "кт ", "мрт ", "узи ", "анализ",
+        ]
+        if any(marker in text_lower for marker in med_markers):
+            await update.message.reply_text("🔍 Обнаружено назначение — проверяю безопасность...")
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action="typing"
+            )
+            check_prompt = PRESCRIPTION_CHECK_PROMPT.format(text=result["text"])
+            answer = agent.ask(check_prompt)
+            if len(answer) <= 4096:
+                await update.message.reply_text(answer)
+            else:
+                for i in range(0, len(answer), 4096):
+                    await update.message.reply_text(answer[i : i + 4096])
+
     except Exception as e:
         logger.error("Error processing photo: %s", e, exc_info=True)
         await update.message.reply_text(f"Ошибка при обработке фото: {e}")
@@ -435,6 +511,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
+    app.add_handler(CommandHandler("sos", cmd_sos))
+    app.add_handler(CommandHandler("hospital", cmd_hospital))
     app.add_handler(CommandHandler("doctor", cmd_doctor))
     app.add_handler(CommandHandler("diary", cmd_diary))
 
