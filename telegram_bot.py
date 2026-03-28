@@ -294,6 +294,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Слушаю...")
 
+    tmp_path = None
     try:
         voice = update.message.voice
         tg_file = await voice.get_file()
@@ -303,7 +304,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
 
         text = transcribe_voice(tmp_path)
-        os.unlink(tmp_path)
 
         # Show what was recognized
         await update.message.reply_text(f"Распознано: {text}")
@@ -329,6 +329,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Error processing voice: %s", e, exc_info=True)
         await update.message.reply_text(f"Ошибка при обработке голосового: {e}")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            os.unlink(tmp_path)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,6 +352,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Обрабатываю {file_name}...")
 
+    tmp_path = None
     try:
         tg_file = await doc.get_file()
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
@@ -360,7 +364,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result["text"],
             {"file_name": file_name, "file_type": result["file_type"]},
         )
-        os.unlink(tmp_path)
 
         await update.message.reply_text(
             f"Готово! {file_name}: {chunks} фрагментов ({result['char_count']} символов) "
@@ -369,6 +372,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Error processing document: %s", e, exc_info=True)
         await update.message.reply_text(f"Ошибка при обработке {file_name}: {e}")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            os.unlink(tmp_path)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,6 +384,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Обрабатываю фото (OCR)...")
 
+    tmp_path = None
     try:
         photo = update.message.photo[-1]  # largest resolution
         tg_file = await photo.get_file()
@@ -392,7 +399,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result["text"],
             {"file_name": file_name, "file_type": "image"},
         )
-        os.unlink(tmp_path)
 
         # Show a preview of extracted text
         preview = result["text"][:300]
@@ -406,6 +412,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Error processing photo: %s", e, exc_info=True)
         await update.message.reply_text(f"Ошибка при обработке фото: {e}")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            os.unlink(tmp_path)
 
 
 def main():
@@ -414,6 +423,11 @@ def main():
         print("1. Create a bot via @BotFather in Telegram")
         print("2. Add TELEGRAM_BOT_TOKEN=your_token to .env")
         return
+
+    if not ALLOWED_USERS:
+        logger.warning("TELEGRAM_ALLOWED_USERS is empty — bot accepts ALL users (DEV MODE)")
+    if not PATIENT_ID:
+        logger.warning("TELEGRAM_PATIENT_ID not set — diary auto-recording disabled")
 
     app = Application.builder().token(BOT_TOKEN).build()
 

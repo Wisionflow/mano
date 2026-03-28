@@ -1,9 +1,7 @@
 anthropic>=0.39.0
 chromadb>=0.5.0
-llama-index-core>=0.11.0
-llama-index-vector-stores-chroma>=0.2.0
-llama-index-embeddings-huggingface>=0.3.0
 gradio>=4.0.0
+uvicorn>=0.20.0
 pdfplumber>=0.11.0
 pytesseract>=0.3.10
 easyocr>=1.7.0
@@ -14,3 +12,6 @@ plotly>=5.18.0
 python-dotenv>=1.0.0
 python-telegram-bot>=21.0
 SpeechRecognition>=3.10.0
+# System dependencies (not pip):
+# - ffmpeg: required for voice messages (apt install ffmpeg / brew install ffmpeg / winget install ffmpeg)
+# - tesseract-ocr: required for image OCR (apt install tesseract-ocr tesseract-ocr-rus)

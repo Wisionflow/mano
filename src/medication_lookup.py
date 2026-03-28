@@ -1,7 +1,6 @@
 """Medication alternatives lookup using Claude."""
 
 import os
-from typing import Dict, Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
