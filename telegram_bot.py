@@ -21,6 +21,7 @@ from src.vector_store import VectorStore
 from src.medical_agent import MedicalAgent
 from src.health_diary import is_health_status, save_entry, load_entries, format_entries
 from src.emergency_card import EMERGENCY_CARD, HOSPITAL_CARD
+from src.lab_tracker import extract_lab_values, save_lab_values, format_trends, format_param_detail
 
 load_dotenv()
 logging.basicConfig(
@@ -68,6 +69,7 @@ WELCOME_TEXT = (
     "/sos — экстренная карточка для скорой\n"
     "/hospital — сводка для приёмного отделения\n"
     "/doctor — подготовить речь для врача\n"
+    "/labs — показатели (тренды)\n"
     "/diary — дневник самочувствия\n"
     "/files — список документов в базе\n"
     "/clear — очистить историю диалога\n\n"
@@ -250,6 +252,25 @@ async def cmd_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     entries = load_entries(last_n=n)
     text = format_entries(entries)
+
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
+    else:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i : i + 4096])
+
+
+async def cmd_labs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /labs — show lab value trends. /labs креатинин for detail."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    args = context.args
+    if args:
+        param = " ".join(args)
+        text = format_param_detail(param)
+    else:
+        text = format_trends()
 
     if len(text) <= 4096:
         await update.message.reply_text(text)
@@ -465,6 +486,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Распознанный текст:\n{preview}"
         )
 
+        # Auto-extract lab values and save to tracker
+        lab_values = extract_lab_values(result["text"])
+        if lab_values:
+            saved = save_lab_values(lab_values)
+            if saved:
+                param_list = ", ".join(f"{v['param']} {v['value']}" for v in lab_values[:5])
+                await update.message.reply_text(
+                    f"📊 Найдено {len(lab_values)} показателей, сохранено {saved} новых: {param_list}"
+                )
+
         # Auto-check for prescriptions/procedures in the recognized text
         text_lower = result["text"].lower()
         med_markers = [
@@ -511,6 +542,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
+    app.add_handler(CommandHandler("labs", cmd_labs))
     app.add_handler(CommandHandler("sos", cmd_sos))
     app.add_handler(CommandHandler("hospital", cmd_hospital))
     app.add_handler(CommandHandler("doctor", cmd_doctor))

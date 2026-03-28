@@ -3,5 +3,6 @@ venv/
 __pycache__/
 data/db/
 data/health_diary.json
+data/lab_values.json
 *.pyc
 .DS_Store
