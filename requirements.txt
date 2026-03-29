@@ -12,6 +12,7 @@ plotly>=5.18.0
 python-dotenv>=1.0.0
 python-telegram-bot>=21.0
 SpeechRecognition>=3.10.0
+openai-whisper>=20231117
 # System dependencies (not pip):
 # - ffmpeg: required for voice messages (apt install ffmpeg / brew install ffmpeg / winget install ffmpeg)
 # - tesseract-ocr: required for image OCR (apt install tesseract-ocr tesseract-ocr-rus)

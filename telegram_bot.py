@@ -22,6 +22,10 @@ from src.medical_agent import MedicalAgent
 from src.health_diary import is_health_status, save_entry, load_entries, format_entries
 from src.emergency_card import EMERGENCY_CARD, HOSPITAL_CARD
 from src.lab_tracker import extract_lab_values, save_lab_values, format_trends, format_param_detail
+from src.audio_transcriber import (
+    transcribe_audio, save_transcript, format_transcript_md,
+    SUPPORTED_AUDIO,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -64,7 +68,8 @@ WELCOME_TEXT = (
     "- Искать аналоги лекарств\n"
     "- Проверять назначения врачей на совместимость\n\n"
     "Можно писать текстом или отправить голосовое сообщение.\n"
-    "Документы (PDF, фото, Excel) — добавлю в базу знаний.\n\n"
+    "Документы (PDF, фото, Excel) — добавлю в базу знаний.\n"
+    "Аудиозапись визита к врачу — транскрибирую и проанализирую.\n\n"
     "Команды:\n"
     "/sos — экстренная карточка для скорой\n"
     "/hospital — сводка для приёмного отделения\n"
@@ -118,6 +123,36 @@ DOCTOR_VISIT_PROMPT = """Пациентка идёт на приём к врач
 
 
 # Prescription/procedure verification prompt
+VISIT_ANALYSIS_PROMPT = """Это транскрипт аудиозаписи медицинского визита пациентки.
+
+ЗАДАЧА 1 — ИДЕНТИФИКАЦИЯ СПИКЕРОВ:
+Определи по контексту речи кто говорит в каждом сегменте:
+- ВРАЧ — использует медицинские термины, задаёт вопросы о симптомах, назначает, осматривает
+- ПАЦИЕНТКА (Ольга) — описывает жалобы, отвечает на вопросы врача о самочувствии
+- СОПРОВОЖДАЮЩИЙ — дополняет, уточняет, задаёт вопросы врачу от третьего лица
+
+Перепиши ключевые моменты с указанием спикера.
+
+ЗАДАЧА 2 — СОПОСТАВЛЕНИЕ С ДОКУМЕНТОМ ВИЗИТА:
+Сравни что было СКАЗАНО на приёме с тем что НАПИСАНО в документе.
+Найди:
+- Расхождения (врач сказал одно, в документе другое)
+- Что обсуждалось устно, но НЕ попало в документ
+- Что в документе есть, но на приёме НЕ обсуждалось
+- Нюансы и оговорки врача которые важны но не зафиксированы
+
+ЗАДАЧА 3 — РИСКИ И ВАЖНОЕ:
+- Устные рекомендации врача которые легко забыть
+- Предупреждения и оговорки
+- Что нужно сделать (анализы, записи к другим врачам, дневник)
+- Противоречия между устными словами и письменным документом
+
+ФОРМАТ: структурированный отчёт на русском, с цитатами из транскрипта.
+
+ТРАНСКРИПТ:
+{transcript}"""
+
+
 PRESCRIPTION_CHECK_PROMPT = """Пациентка прислала фото рецепта или медицинского назначения.
 Распознанный текст ниже.
 
@@ -419,10 +454,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name = doc.file_name or "document"
     ext = Path(file_name).suffix.lower()
 
+    # Redirect audio files to the audio handler
+    if ext in SUPPORTED_AUDIO:
+        await handle_audio(update, context)
+        return
+
     if ext not in SUPPORTED_EXTENSIONS:
         await update.message.reply_text(
             f"Формат {ext} не поддерживается.\n"
-            f"Поддерживаемые: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            f"Поддерживаемые: {', '.join(sorted(SUPPORTED_EXTENSIONS | SUPPORTED_AUDIO))}"
         )
         return
 
@@ -448,6 +488,82 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Error processing document: %s", e, exc_info=True)
         await update.message.reply_text(f"Ошибка при обработке {file_name}: {e}")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            os.unlink(tmp_path)
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle audio file uploads — transcribe with Whisper and analyze visit."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    # Audio can come as audio message or as document
+    if update.message.audio:
+        tg_file = await update.message.audio.get_file()
+        file_name = update.message.audio.file_name or "audio.mp3"
+        duration = update.message.audio.duration or 0
+    elif update.message.document:
+        ext = Path(update.message.document.file_name or "").suffix.lower()
+        if ext not in SUPPORTED_AUDIO:
+            return  # not an audio file, let handle_document deal with it
+        tg_file = await update.message.document.get_file()
+        file_name = update.message.document.file_name or "audio"
+        duration = 0
+    else:
+        return
+
+    duration_str = f" ({duration // 60}:{duration % 60:02d})" if duration else ""
+    await update.message.reply_text(
+        f"Транскрибирую {file_name}{duration_str}...\n"
+        "Это может занять несколько минут для длинных записей."
+    )
+
+    tmp_path = None
+    try:
+        ext = Path(file_name).suffix.lower() or ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            await tg_file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+
+        # Transcribe with Whisper
+        result = transcribe_audio(tmp_path)
+        duration_min = result["duration"] / 60
+
+        # Save transcript to med_docs_olga/
+        transcript_path = save_transcript(result, file_name)
+
+        await update.message.reply_text(
+            f"Транскрибация завершена: {duration_min:.1f} мин, "
+            f"{len(result['segments'])} сегментов.\n"
+            f"Сохранено: {transcript_path.name}\n\n"
+            "Анализирую визит..."
+        )
+
+        # Add transcript to vector store
+        md_text = format_transcript_md(result, file_name)
+        vector_store.add_document(
+            md_text,
+            {"file_name": transcript_path.name, "file_type": "transcript"},
+        )
+
+        # Analyze visit with Claude — speaker ID + cross-reference with docs
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="typing"
+        )
+        analysis_prompt = VISIT_ANALYSIS_PROMPT.format(transcript=md_text)
+        answer = agent.ask(analysis_prompt)
+
+        # Send analysis — may be long
+        if len(answer) <= 4096:
+            await update.message.reply_text(answer)
+        else:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i : i + 4096])
+
+    except Exception as e:
+        logger.error("Error transcribing audio: %s", e, exc_info=True)
+        await update.message.reply_text(f"Ошибка при транскрибации: {e}")
     finally:
         if tmp_path and Path(tmp_path).exists():
             os.unlink(tmp_path)
@@ -551,6 +667,7 @@ def main():
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
