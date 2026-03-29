@@ -92,7 +92,7 @@ class MedicalAgent:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set. Create a .env file with your key.")
 
-        self.client = Anthropic(api_key=api_key)
+        self.client = Anthropic(api_key=api_key, timeout=120.0, max_retries=3)
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
         self.vector_store = vector_store or VectorStore()
         self.conversation_history: List[Dict[str, str]] = []

@@ -1,8 +1,10 @@
 .env
 venv/
 __pycache__/
-data/db/
-data/health_diary.json
-data/lab_values.json
 *.pyc
 .DS_Store
+
+# Patient data — NEVER commit
+med_docs_olga/
+data/
+logs/

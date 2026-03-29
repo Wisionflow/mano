@@ -112,6 +112,17 @@ DOCTOR_VISIT_PROMPT = """Пациентка идёт на приём к врач
 очень плохо" + факт про аллергию на замену. Любой врач может назначить несовместимое
 или предложить отмену — пациентка должна это предупредить.
 
+ВАЖНО — ОШИБКИ В ЕМИАС:
+Документы в ЕМИАС могут содержать неточности. Известные расхождения:
+- Визит к нефрологу 29.03.2026: в ЕМИАС записано "мочеиспускание свободно,
+  безболезненное" — на самом деле есть ложные позывы (ощущение цистита).
+  Нефролог подтвердила проблему устно, но не записала.
+- Инцидент с заменой дулоксетина/габапентина неврологом — не зафиксирован в ЕМИАС.
+- Пороги эскалации креатинина (170+ срочно, 200+ стационар) — не записаны.
+Если речь готовится для специалиста, которому важны эти факты — ВКЛЮЧИ
+корректировку в речь пациентки ("доктор, в карте написано что мочеиспускание
+в норме, но на самом деле...").
+
 ФОРМАТ:
 - Речь от первого лица, начинается с "Доктор, ..."
 - Разговорный стиль, как человек говорит устно
@@ -195,38 +206,14 @@ def is_allowed(user_id: int) -> bool:
 # --- Voice transcription ---
 
 def transcribe_voice(ogg_path: str) -> str:
-    """Convert voice message to text using speech_recognition + Google API."""
-    import speech_recognition as sr
+    """Convert voice message to text using local Whisper (no data sent to cloud)."""
+    from src.audio_transcriber import transcribe_audio
 
-    # Convert OGG/OGA to WAV using ffmpeg
-    wav_path = ogg_path + ".wav"
-    try:
-        subprocess.run(
-            ["ffmpeg", "-i", ogg_path, "-ar", "16000", "-ac", "1", "-y", wav_path],
-            capture_output=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "ffmpeg не найден. Установите ffmpeg для работы с голосовыми сообщениями."
-        )
-
-    if not Path(wav_path).exists():
-        raise RuntimeError("Не удалось конвертировать аудио.")
-
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(wav_path) as source:
-        audio = recognizer.record(source)
-
-    os.unlink(wav_path)
-
-    try:
-        text = recognizer.recognize_google(audio, language="ru-RU")
-        return text
-    except sr.UnknownValueError:
+    result = transcribe_audio(ogg_path)
+    text = result["text"].strip()
+    if not text:
         raise RuntimeError("Не удалось распознать речь. Попробуй сказать ещё раз.")
-    except sr.RequestError as e:
-        raise RuntimeError(f"Ошибка сервиса распознавания: {e}")
+    return text
 
 
 async def _ask_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
