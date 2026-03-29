@@ -194,6 +194,102 @@ PRESCRIPTION_CHECK_PROMPT = """Пациентка прислала фото ре
 {text}"""
 
 
+# --- Auto-detect doctor visit ---
+
+_DOCTOR_KEYWORDS = {
+    "нефролог": "нефролог",
+    "уролог": "уролог",
+    "терапевт": "терапевт",
+    "участков": "терапевт (участковый)",
+    "невролог": "невролог",
+    "онколог": "онколог",
+    "гинеколог": "гинеколог",
+    "эндокринолог": "эндокринолог",
+    "кардиолог": "кардиолог",
+    "гастроэнтеролог": "гастроэнтеролог",
+    "хирург": "хирург",
+    "окулист": "окулист",
+    "офтальмолог": "офтальмолог",
+    "дерматолог": "дерматолог",
+    "лор": "ЛОР",
+    "отоларинголог": "ЛОР",
+    "ревматолог": "ревматолог",
+    "пульмонолог": "пульмонолог",
+    "психиатр": "психиатр",
+    "психотерапевт": "психотерапевт",
+}
+
+# Stems for fuzzy match (handles typos like "учестковобу", "нефрологу", "тирапевту")
+_DOCTOR_STEMS = {
+    "нефр": "нефролог",
+    "урол": "уролог",
+    "терап": "терапевт",
+    "участк": "терапевт (участковый)",
+    "учест": "терапевт (участковый)",
+    "невр": "невролог",
+    "онко": "онколог",
+    "гинек": "гинеколог",
+    "эндокр": "эндокринолог",
+    "кардио": "кардиолог",
+    "гастр": "гастроэнтеролог",
+    "хирур": "хирург",
+    "окули": "окулист",
+    "офтальм": "офтальмолог",
+    "дерма": "дерматолог",
+    "ревмат": "ревматолог",
+    "пульм": "пульмонолог",
+    "психиат": "психиатр",
+    "психот": "психотерапевт",
+}
+
+_VISIT_MARKERS = [
+    "иду к", "иду на", "еду к", "еду на", "записана к", "записалась к",
+    "завтра к", "сегодня к", "пойду к", "поеду к", "была у", "хожу к",
+    "приём у", "прием у", "визит к", "на приём", "на прием", "к врачу",
+    "запись к", "направили к", "отправили к", "пойдём к", "пойдем к",
+    "уду к", "буду у",
+]
+
+
+def _find_specialty(text: str) -> str | None:
+    """Find doctor specialty in text, with fuzzy stem matching."""
+    lower = text.lower()
+    # Exact keyword match first
+    for keyword, specialty in _DOCTOR_KEYWORDS.items():
+        if keyword in lower:
+            return specialty
+    # Fuzzy stem match (handles typos and word forms)
+    for stem, specialty in _DOCTOR_STEMS.items():
+        if stem in lower:
+            return specialty
+    return None
+
+
+def _detect_doctor_visit(text: str) -> str | None:
+    """Detect if user mentions going to a doctor. Return specialty or None."""
+    lower = text.lower().strip()
+
+    # Check for visit markers
+    has_marker = any(marker in lower for marker in _VISIT_MARKERS)
+
+    # Check for time words
+    time_words = ["завтра", "сегодня", "утром", "вечером", "послезавтра"]
+    has_time = any(tw in lower for tw in time_words)
+
+    # Check for generic visit words
+    visit_words = ["врач", "доктор", "приём", "прием", "поликлиник", "больниц"]
+    has_visit_word = any(vw in lower for vw in visit_words)
+
+    if has_marker or has_time or has_visit_word:
+        specialty = _find_specialty(lower)
+        if specialty:
+            return specialty
+        if has_marker or has_visit_word:
+            return "терапевт"
+
+    return None
+
+
 # --- Access control ---
 
 def is_allowed(user_id: int) -> bool:
@@ -368,6 +464,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+
+    # Auto-detect doctor visit — prepare speech automatically
+    doctor_specialty = _detect_doctor_visit(question)
+    if doctor_specialty:
+        await update.message.reply_text(f"Готовлю речь для {doctor_specialty}...")
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="typing"
+        )
+        prompt = DOCTOR_VISIT_PROMPT.format(specialty=doctor_specialty)
+        answer = agent.ask(prompt)
+        if len(answer) <= 4096:
+            await update.message.reply_text(answer)
+        else:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i : i + 4096])
+        return
 
     # Auto-detect health status — diary only from patient
     if is_health_status(question):
