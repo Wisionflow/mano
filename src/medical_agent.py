@@ -1,4 +1,8 @@
-"""Medical AI agent powered by Claude for Q&A over patient documents."""
+"""Medical AI agent powered by Claude for Q&A over patient documents.
+
+Supports multi-patient: pass patient_id to constructor for isolated data.
+Legacy mode (no patient_id) uses the original med_docs_olga/ MEDICAL_SUMMARY.md.
+"""
 
 import os
 from pathlib import Path
@@ -12,7 +16,7 @@ from src.health_diary import get_diary_context
 
 load_dotenv()
 
-# Load medical summary if available — gives the agent full context
+# Legacy single-patient summary (backward compat)
 _SUMMARY_PATH = Path(__file__).resolve().parent.parent / "med_docs_olga" / "MEDICAL_SUMMARY.md"
 _MEDICAL_SUMMARY = ""
 if _SUMMARY_PATH.exists():
@@ -88,18 +92,29 @@ MEDICATION_KEYWORDS = [
 
 
 class MedicalAgent:
-    """Claude-powered medical Q&A agent with RAG."""
+    """Claude-powered medical Q&A agent with RAG.
 
-    def __init__(self, vector_store: VectorStore = None):
+    Multi-patient: pass patient_id to use patient-specific data.
+    Legacy: no patient_id uses global med_docs_olga/MEDICAL_SUMMARY.md.
+    """
+
+    def __init__(self, vector_store: VectorStore = None, patient_id: str = None):
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set. Create a .env file with your key.")
 
         self.client = Anthropic(api_key=api_key, timeout=120.0, max_retries=3)
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+        self.patient_id = patient_id
         self.vector_store = vector_store or VectorStore()
         self.conversation_history: List[Dict[str, str]] = []
-        self.medical_summary = _MEDICAL_SUMMARY
+
+        # Load medical summary — dynamic from profile or legacy static file
+        if patient_id:
+            from src.patient_manager import build_medical_summary
+            self.medical_summary = build_medical_summary(patient_id)
+        else:
+            self.medical_summary = _MEDICAL_SUMMARY
 
     def _retrieve_context(self, query: str, n_results: int = 8) -> str:
         """Retrieve relevant document chunks for the query."""
@@ -126,7 +141,13 @@ class MedicalAgent:
         q = question.lower()
         return any(kw in q for kw in MEDICATION_KEYWORDS)
 
-    def ask(self, question: str) -> str:
+    def reload_summary(self):
+        """Reload medical summary from profile (call after profile update)."""
+        if self.patient_id:
+            from src.patient_manager import build_medical_summary
+            self.medical_summary = build_medical_summary(self.patient_id)
+
+    def ask(self, question: str, sender_telegram_id: int = None, sender_name: str = None) -> str:
         """Ask a question about the patient's medical history."""
         context = self._retrieve_context(question)
 
@@ -135,13 +156,54 @@ class MedicalAgent:
         if self._is_medication_query(question):
             system += MEDICATION_PROMPT_ADDITION
 
+        # For multi-patient: adapt language and healthcare system
+        if self.patient_id:
+            from src.patient_manager import load_profile
+            profile = load_profile(self.patient_id)
+            if profile:
+                if profile.get("language") == "lt":
+                    system += "\n\nОТВЕЧАЙ НА ЛИТОВСКОМ ЯЗЫКЕ (lietuvių kalba). Пациент говорит по-литовски."
+
+                # Load healthcare system context
+                hs = profile.get("healthcare_system", "")
+                if hs:
+                    hs_path = Path(__file__).resolve().parent.parent / "config" / "healthcare_systems" / f"{hs}.md"
+                    if hs_path.exists():
+                        hs_text = hs_path.read_text(encoding="utf-8")
+                        system += f"\n\nКОНТЕКСТ СИСТЕМЫ ЗДРАВООХРАНЕНИЯ:\n{hs_text}"
+
         # Build message with medical summary + diary + RAG context
         parts = []
         if self.medical_summary:
             parts.append(f"МЕДИЦИНСКАЯ СВОДКА ПАЦИЕНТА:\n{self.medical_summary}")
-        diary = get_diary_context(last_n=10)
+        diary = get_diary_context(last_n=10, patient_id=self.patient_id)
         if diary:
             parts.append(diary)
+
+        # Include current medications context
+        if self.patient_id:
+            from src.medication_tracker import get_current_medications, get_active_courses
+            current_meds = get_current_medications(self.patient_id)
+            active_courses = get_active_courses(self.patient_id)
+            if current_meds or active_courses:
+                med_lines = ["ТЕКУЩИЕ ЛЕКАРСТВА (из трекера):"]
+                for m in current_meds:
+                    line = f"• {m['name']} {m.get('dose', '')} {m.get('frequency', '')}"
+                    if m.get("critical"):
+                        line += " [КРИТИЧЕСКИ ВАЖНО — НЕ ОТМЕНЯТЬ]"
+                    med_lines.append(line)
+                for c in active_courses:
+                    line = f"• {c['name']} {c.get('dose', '')} (курс до {c.get('end_date', '?')})"
+                    med_lines.append(line)
+                parts.append("\n".join(med_lines))
+
+        # Load persistent conversation context for continuity across sessions
+        if self.patient_id and not self.conversation_history:
+            from src.patient_manager import get_conversation_context
+            conv_ctx = get_conversation_context(self.patient_id, limit=10)
+            if conv_ctx:
+                parts.append(conv_ctx)
+
         parts.append(f"КОНТЕКСТ ИЗ ДОКУМЕНТОВ ПАЦИЕНТА:\n{context}")
         parts.append(f"ВОПРОС: {question}")
 
@@ -167,6 +229,14 @@ class MedicalAgent:
         # Keep history manageable (last 20 messages)
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
+
+        # Persist to conversation DB
+        if self.patient_id:
+            from src.patient_manager import save_message
+            save_message(self.patient_id, "user", question,
+                         sender_telegram_id=sender_telegram_id,
+                         sender_name=sender_name)
+            save_message(self.patient_id, "assistant", answer)
 
         return answer
 

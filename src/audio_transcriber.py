@@ -20,8 +20,16 @@ _model_name = os.getenv("WHISPER_MODEL", "large-v3")
 
 SUPPORTED_AUDIO = {".mp3", ".m4a", ".ogg", ".oga", ".wav", ".flac", ".webm", ".mp4"}
 
-# Output directory for transcripts
+# Legacy output directory for transcripts
 TRANSCRIPT_DIR = Path(__file__).resolve().parent.parent / "med_docs_olga"
+
+
+def _transcript_dir(patient_id: str = None) -> Path:
+    """Get transcript output directory — patient-specific or legacy."""
+    if patient_id:
+        from src.patient_manager import get_patient_dir
+        return get_patient_dir(patient_id) / "documents"
+    return TRANSCRIPT_DIR
 
 
 def _get_model():
@@ -94,16 +102,17 @@ def format_transcript_md(transcription: dict, source_filename: str = "") -> str:
     return "\n".join(lines)
 
 
-def save_transcript(transcription: dict, source_filename: str) -> Path:
-    """Save transcription as markdown file in med_docs_olga/."""
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+def save_transcript(transcription: dict, source_filename: str, patient_id: str = None) -> Path:
+    """Save transcription as markdown file."""
+    out_dir = _transcript_dir(patient_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     stem = Path(source_filename).stem
     # Sanitize filename
     safe_stem = "".join(c if c.isalnum() or c in "-_ " else "_" for c in stem)
     out_name = f"{date_str}_transcript_{safe_stem}.md"
-    out_path = TRANSCRIPT_DIR / out_name
+    out_path = out_dir / out_name
 
     md = format_transcript_md(transcription, source_filename)
     out_path.write_text(md, encoding="utf-8")

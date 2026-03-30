@@ -8,6 +8,14 @@ from typing import Optional
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "lab_values.json"
 
+
+def _data_path(patient_id: str = None) -> Path:
+    """Get lab values path — patient-specific if patient_id given."""
+    if patient_id:
+        from src.patient_manager import get_patient_dir
+        return get_patient_dir(patient_id) / "lab_values.json"
+    return DATA_PATH
+
 # Key lab parameters to track with units and normal ranges
 LAB_PARAMS = {
     "креатинин": {"unit": "мкмоль/л", "norm_min": 44, "norm_max": 96, "critical_high": 200},
@@ -57,21 +65,39 @@ ALIASES = {
     "скф": "рскф", "gfr": "рскф", "клубочковая фильтрация": "рскф",
     "щелочная фосфатаза": "щф",
     "оксалат кальция": "оксалаты", "кристаллы оксалата": "оксалаты",
+    # Lithuanian aliases
+    "kreatininas": "креатинин",
+    "hemoglobinas": "гемоглобин", "hgb": "гемоглобин",
+    "gliukozė": "глюкоза", "gliukoze": "глюкоза", "gli": "глюкоза",
+    "šlapimas": "мочевина", "slapimas": "мочевина",
+    "kalcis": "кальций",
+    "fosforas": "фосфор",
+    "kalio": "калий",
+    "natrio": "натрий",
+    "geležis": "железо", "gelezis": "железо",
+    "feritinas": "ферритин",
+    "eng": "соэ",
+    "trombocitai": "тромбоциты",
+    "leukocitai": "лейкоциты",
+    "gfg": "рскф",
+    "crb": "общий белок",
 }
 
 
-def _load() -> list:
-    if not DATA_PATH.exists():
+def _load(patient_id: str = None) -> list:
+    path = _data_path(patient_id)
+    if not path.exists():
         return []
     try:
-        return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
         return []
 
 
-def _save(entries: list):
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DATA_PATH.write_text(
+def _save(entries: list, patient_id: str = None):
+    path = _data_path(patient_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
@@ -145,12 +171,12 @@ def extract_lab_values(text: str) -> list:
     return results
 
 
-def save_lab_values(values: list) -> int:
+def save_lab_values(values: list, patient_id: str = None) -> int:
     """Save extracted lab values to storage. Returns count of new values saved."""
     if not values:
         return 0
 
-    entries = _load()
+    entries = _load(patient_id)
     saved = 0
 
     for v in values:
@@ -170,17 +196,17 @@ def save_lab_values(values: list) -> int:
             saved += 1
 
     if saved:
-        _save(entries)
+        _save(entries, patient_id)
     return saved
 
 
-def get_param_history(param: str, last_n: int = 10) -> list:
+def get_param_history(param: str, last_n: int = 10, patient_id: str = None) -> list:
     """Get history of a specific parameter, sorted by date."""
     normalized = _normalize_param(param)
     if not normalized:
         return []
 
-    entries = _load()
+    entries = _load(patient_id)
     history = [e for e in entries if e["param"] == normalized]
     history.sort(key=lambda x: x["date"])
 
@@ -189,9 +215,9 @@ def get_param_history(param: str, last_n: int = 10) -> list:
     return history
 
 
-def get_all_latest() -> dict:
+def get_all_latest(patient_id: str = None) -> dict:
     """Get the most recent value for each tracked parameter."""
-    entries = _load()
+    entries = _load(patient_id)
     latest = {}
     for e in sorted(entries, key=lambda x: x["date"]):
         latest[e["param"]] = e
@@ -199,9 +225,9 @@ def get_all_latest() -> dict:
     return latest
 
 
-def format_trends() -> str:
+def format_trends(patient_id: str = None) -> str:
     """Format all tracked parameters with trends for display."""
-    latest = get_all_latest()
+    latest = get_all_latest(patient_id)
     if not latest:
         return "Трекер показателей пуст. Отправь фото анализа — я извлеку цифры."
 
@@ -221,7 +247,7 @@ def format_trends() -> str:
         date = e["date"]
 
         # Trend arrow
-        history = get_param_history(param_name, last_n=3)
+        history = get_param_history(param_name, last_n=3, patient_id=patient_id)
         trend = ""
         if len(history) >= 2:
             prev = history[-2]["value"]
@@ -276,13 +302,13 @@ def format_trends() -> str:
     return "\n".join(lines)
 
 
-def format_param_detail(param: str) -> str:
+def format_param_detail(param: str, patient_id: str = None) -> str:
     """Format detailed history of one parameter."""
     normalized = _normalize_param(param)
     if not normalized:
         return f"Параметр '{param}' не найден. Доступные: {', '.join(sorted(LAB_PARAMS.keys()))}"
 
-    history = get_param_history(normalized)
+    history = get_param_history(normalized, patient_id=patient_id)
     if not history:
         return f"Нет данных по '{normalized}'."
 

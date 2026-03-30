@@ -1,11 +1,24 @@
-"""Health diary — chronological log of how the patient feels."""
+"""Health diary — chronological log of how the patient feels.
+
+Supports multi-patient: pass patient_id to all functions, or use legacy
+global DIARY_PATH for backward compatibility.
+"""
 
 import json
 import re
 from datetime import datetime
 from pathlib import Path
 
+# Legacy single-patient path (backward compat)
 DIARY_PATH = Path(__file__).resolve().parent.parent / "data" / "health_diary.json"
+
+
+def _diary_path(patient_id: str = None) -> Path:
+    """Get diary path — patient-specific if patient_id given, else legacy."""
+    if patient_id:
+        from src.patient_manager import get_patient_dir
+        return get_patient_dir(patient_id) / "health_diary.json"
+    return DIARY_PATH
 
 # Keywords that indicate the patient is describing how she feels
 FEELING_KEYWORDS = [
@@ -65,7 +78,7 @@ def is_health_status(text: str) -> bool:
     return keyword_count >= 1
 
 
-def save_entry(text: str, reported_by: str = None) -> dict:
+def save_entry(text: str, reported_by: str = None, patient_id: str = None) -> dict:
     """Save a diary entry with timestamp. reported_by = family member name if not patient."""
     entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -74,24 +87,26 @@ def save_entry(text: str, reported_by: str = None) -> dict:
     if reported_by:
         entry["reported_by"] = reported_by
 
-    entries = load_entries()
+    entries = load_entries(patient_id=patient_id)
     entries.append(entry)
 
-    DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DIARY_PATH.write_text(
+    path = _diary_path(patient_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(entries, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return entry
 
 
-def load_entries(last_n: int = 0) -> list:
+def load_entries(last_n: int = 0, patient_id: str = None) -> list:
     """Load diary entries. If last_n > 0, return only last N entries."""
-    if not DIARY_PATH.exists():
+    path = _diary_path(patient_id)
+    if not path.exists():
         return []
 
     try:
-        entries = json.loads(DIARY_PATH.read_text(encoding="utf-8"))
+        entries = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
         return []
 
@@ -113,9 +128,9 @@ def format_entries(entries: list) -> str:
     return "\n\n".join(lines)
 
 
-def get_diary_context(last_n: int = 10) -> str:
+def get_diary_context(last_n: int = 10, patient_id: str = None) -> str:
     """Get recent diary entries as context for the agent."""
-    entries = load_entries(last_n=last_n)
+    entries = load_entries(last_n=last_n, patient_id=patient_id)
     if not entries:
         return ""
 
