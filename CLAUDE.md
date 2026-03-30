@@ -99,7 +99,8 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 ```
 
 ## Telegram Bot Commands
-- **/start** — welcome message (language-adapted)
+- **/start** — welcome message (shows active patient if multi-access)
+- **/switch [patient_id]** — switch active patient (for users with multi-patient access)
 - **/sos** — emergency card for paramedics (dynamic from profile)
 - **/hospital** — full summary for ER admission
 - **/doctor [specialty]** — speech for doctor visit (healthcare-system-aware)
@@ -122,12 +123,14 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 - **Lab values from photos** → auto-extract to tracker
 
 ## Multi-Patient Flow
-1. Register patient via `register_patients.py` (patient_id, telegram_id, language, healthcare_system)
-2. Bot routes by telegram_user_id → patient_id
-3. Each patient gets isolated VectorStore, MedicalAgent, diary, labs, meds
-4. Conversation history persists in SQLite (conversations.db)
-5. Profile builds incrementally from uploaded documents
-6. System prompt includes: patient profile + healthcare system + medications + diary + conversation history
+- **Registry v2** (`data/patient_registry.json`): one user → multiple patients with roles
+- Each user has `patients: {patient_id: role}` where role = "patient" | "family"
+- `default_patient` sets which patient is active on bot start
+- **/switch** lets users change active patient at runtime (in-memory)
+- Each patient gets isolated VectorStore, MedicalAgent, diary, labs, meds
+- Profile builds incrementally from uploaded documents
+- System prompt includes: patient profile + healthcare system + medications + diary + conversation history
+- **Caregiver pattern**: a family member (e.g. husband) manages patient's data without being a patient themselves
 
 ## Supported Languages
 - **ru** — Russian (full support)

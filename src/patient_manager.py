@@ -27,13 +27,33 @@ REGISTRY_PATH = Path(__file__).resolve().parent.parent / "data" / "patient_regis
 
 
 def _load_registry() -> dict:
-    """Load patient registry mapping telegram IDs to patient IDs."""
+    """Load patient registry (v2: multi-patient access per user)."""
     if not REGISTRY_PATH.exists():
-        return {"patients": {}, "access": {}}
+        return {"version": 2, "patients": {}, "access": {}}
     try:
-        return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        # Auto-migrate v1 → v2
+        if data.get("version", 1) < 2:
+            data = _migrate_registry_v1_to_v2(data)
+            _save_registry(data)
+        return data
     except (json.JSONDecodeError, ValueError):
-        return {"patients": {}, "access": {}}
+        return {"version": 2, "patients": {}, "access": {}}
+
+
+def _migrate_registry_v1_to_v2(old: dict) -> dict:
+    """Migrate v1 registry (single patient per user) to v2 (multi-patient)."""
+    new = {"version": 2, "patients": old.get("patients", {}), "access": {}}
+    for tg_id, entry in old.get("access", {}).items():
+        pid = entry.get("patient_id", "")
+        role = entry.get("role", "family")
+        name = entry.get("name", "")
+        new["access"][tg_id] = {
+            "name": name,
+            "patients": {pid: role},
+            "default_patient": pid,
+        }
+    return new
 
 
 def _save_registry(registry: dict):
@@ -54,8 +74,8 @@ def register_patient(
     """Register a new patient and create their data directory.
 
     Args:
-        patient_id: Unique slug (e.g. "olga", "mama", "colleague-wife")
-        patient_telegram_id: Telegram user ID of the patient
+        patient_id: Unique slug (e.g. "olga", "maria", "vasiliy-wife")
+        patient_telegram_id: Telegram user ID of the patient (or caregiver)
         name: Display name
         language: Interface language ("ru", "lt")
         healthcare_system: Healthcare system config to use
@@ -65,27 +85,36 @@ def register_patient(
 
     # Create patient entry
     registry["patients"][patient_id] = {
-        "telegram_id": patient_telegram_id,
         "name": name,
         "language": language,
         "healthcare_system": healthcare_system,
         "created": datetime.now().isoformat(),
     }
 
-    # Map telegram ID → patient_id + role
-    registry["access"][str(patient_telegram_id)] = {
-        "patient_id": patient_id,
-        "role": "patient",
-    }
+    # Add patient access for the registering user (v2: multi-patient)
+    tg_key = str(patient_telegram_id)
+    if tg_key not in registry["access"]:
+        registry["access"][tg_key] = {
+            "name": name,
+            "patients": {},
+            "default_patient": patient_id,
+        }
+    registry["access"][tg_key]["patients"][patient_id] = "patient"
+    # If this is their first patient, set as default
+    if not registry["access"][tg_key].get("default_patient"):
+        registry["access"][tg_key]["default_patient"] = patient_id
 
-    # Map family members
+    # Map family members — add patient access without overwriting existing access
     if family_members:
         for tg_id, info in family_members.items():
-            registry["access"][str(tg_id)] = {
-                "patient_id": patient_id,
-                "role": "family",
-                "name": info.get("name", ""),
-            }
+            fam_key = str(tg_id)
+            if fam_key not in registry["access"]:
+                registry["access"][fam_key] = {
+                    "name": info.get("name", ""),
+                    "patients": {},
+                    "default_patient": patient_id,
+                }
+            registry["access"][fam_key]["patients"][patient_id] = "family"
 
     _save_registry(registry)
 
@@ -110,31 +139,92 @@ def get_patient_dir(patient_id: str) -> Path:
     return DATA_ROOT / patient_id
 
 
+# --- Active patient tracking (in-memory, per telegram user) ---
+_active_patient: dict[int, str] = {}  # telegram_user_id → patient_id
+
+
 def get_patient_id_by_telegram(telegram_user_id: int) -> Optional[str]:
-    """Look up patient_id for a telegram user. Returns None if not registered."""
+    """Look up active patient_id for a telegram user.
+
+    Priority: 1) explicitly switched, 2) default_patient from registry.
+    """
+    # Check in-memory override first
+    if telegram_user_id in _active_patient:
+        return _active_patient[telegram_user_id]
+
     registry = _load_registry()
     access = registry.get("access", {}).get(str(telegram_user_id))
-    if access:
-        return access["patient_id"]
-    return None
+    if not access:
+        return None
+    return access.get("default_patient")
 
 
-def get_user_role(telegram_user_id: int) -> Optional[str]:
-    """Get role for telegram user: 'patient' or 'family'. None if not registered."""
+def set_active_patient(telegram_user_id: int, patient_id: str) -> bool:
+    """Switch active patient for a user. Returns False if user has no access."""
     registry = _load_registry()
     access = registry.get("access", {}).get(str(telegram_user_id))
-    if access:
-        return access["role"]
-    return None
+    if not access:
+        return False
+    if patient_id not in access.get("patients", {}):
+        return False
+    _active_patient[telegram_user_id] = patient_id
+    return True
+
+
+def get_accessible_patients(telegram_user_id: int) -> dict:
+    """Get all patients this user has access to. Returns {patient_id: role}."""
+    registry = _load_registry()
+    access = registry.get("access", {}).get(str(telegram_user_id))
+    if not access:
+        return {}
+    return access.get("patients", {})
+
+
+def get_user_role(telegram_user_id: int, patient_id: str = None) -> Optional[str]:
+    """Get role for telegram user for a specific patient (or active patient)."""
+    if patient_id is None:
+        patient_id = get_patient_id_by_telegram(telegram_user_id)
+    if not patient_id:
+        return None
+    registry = _load_registry()
+    access = registry.get("access", {}).get(str(telegram_user_id))
+    if not access:
+        return None
+    return access.get("patients", {}).get(patient_id)
 
 
 def get_user_name(telegram_user_id: int) -> Optional[str]:
-    """Get display name for a family member. Returns None for patients."""
+    """Get display name for a user."""
     registry = _load_registry()
     access = registry.get("access", {}).get(str(telegram_user_id))
-    if access and access["role"] == "family":
+    if access:
         return access.get("name")
     return None
+
+
+def get_patient_name(patient_id: str) -> Optional[str]:
+    """Get display name for a patient."""
+    registry = _load_registry()
+    patient = registry.get("patients", {}).get(patient_id)
+    if patient:
+        return patient.get("name")
+    return None
+
+
+def add_patient_access(telegram_user_id: int, patient_id: str, role: str, user_name: str = None):
+    """Grant a user access to a patient (e.g. new family member or self-registration)."""
+    registry = _load_registry()
+    tg_key = str(telegram_user_id)
+    if tg_key not in registry["access"]:
+        registry["access"][tg_key] = {
+            "name": user_name or "",
+            "patients": {},
+            "default_patient": patient_id,
+        }
+    registry["access"][tg_key]["patients"][patient_id] = role
+    if not registry["access"][tg_key].get("default_patient"):
+        registry["access"][tg_key]["default_patient"] = patient_id
+    _save_registry(registry)
 
 
 def get_all_patients() -> dict:

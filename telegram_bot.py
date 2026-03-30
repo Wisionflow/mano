@@ -27,11 +27,15 @@ from src.audio_transcriber import (
 )
 from src.patient_manager import (
     get_patient_id_by_telegram,
+    set_active_patient,
+    get_accessible_patients,
     get_user_role,
     get_user_name,
+    get_patient_name,
     get_patient_dir,
     load_profile,
     build_emergency_card,
+    add_patient_access,
 )
 from src.profile_extractor import process_document_for_profile
 from src.medication_tracker import (
@@ -75,58 +79,122 @@ def _resolve_patient(telegram_user_id: int) -> str | None:
     """Resolve telegram user ID to patient_id. Returns None if not registered."""
     return get_patient_id_by_telegram(telegram_user_id)
 
-WELCOME_TEXT = {
-    "ru": (
-        "Привет! Я Mano — твой медицинский помощник.\n\n"
-        "Я могу:\n"
-        "- Отвечать на вопросы по твоим анализам и документам\n"
-        "- Объяснять медицинские термины простым языком\n"
-        "- Сравнивать показатели в динамике\n"
-        "- Искать аналоги лекарств\n"
-        "- Проверять назначения врачей на совместимость\n\n"
-        "Можно писать текстом или отправить голосовое сообщение.\n"
-        "Документы (PDF, фото, Excel) — добавлю в базу знаний.\n"
-        "Аудиозапись визита к врачу — транскрибирую и проанализирую.\n\n"
-        "Команды:\n"
-        "/sos — экстренная карточка для скорой\n"
-        "/hospital — сводка для приёмного отделения\n"
-        "/doctor — подготовить речь для врача\n"
-        "/labs — показатели (тренды)\n"
-        "/diary — дневник самочувствия\n"
-        "/profile — что я знаю о пациенте\n"
-        "/files — список документов в базе\n"
-        "/clear — очистить историю диалога\n\n"
-        "Фото рецепта/назначения — автоматически проверю безопасность.\n\n"
-        "⚠️ Я не ставлю диагнозы и не заменяю врача."
-    ),
-    "lt": (
-        "Sveiki! Aš Mano — jūsų medicininis asistentas.\n\n"
-        "Galiu:\n"
-        "- Atsakyti į klausimus apie jūsų tyrimus ir dokumentus\n"
-        "- Paaiškinti medicininius terminus paprastai\n"
-        "- Palyginti rodiklius dinamikoje\n"
-        "- Ieškoti vaistų analogų\n"
-        "- Tikrinti vaistų suderinamumą\n\n"
-        "Galima rašyti tekstu arba siųsti balso žinutę.\n"
-        "Dokumentai (PDF, nuotraukos, Excel) — pridėsiu į žinių bazę.\n\n"
-        "Komandos:\n"
-        "/sos — skubi kortelė greitajai\n"
-        "/hospital — suvestinė priėmimo skyriui\n"
-        "/doctor — paruošti kalbą gydytojui\n"
-        "/labs — rodikliai (tendencijos)\n"
-        "/diary — savijautos dienoraštis\n"
-        "/profile — ką žinau apie pacientą\n"
-        "/files — dokumentų sąrašas\n"
-        "/clear — išvalyti dialogo istoriją\n\n"
-        "Recepto/paskyrimo nuotrauka — automatiškai patikrinsiu saugumą.\n\n"
-        "⚠️ Nediagnozuoju ir nepakeičiu gydytojo."
-    ),
-}
-
 NOT_REGISTERED_TEXT = (
     "Вы не зарегистрированы. Обратитесь к администратору.\n"
     "You are not registered. Contact the administrator."
 )
+
+
+def _build_welcome(telegram_user_id: int, patient_id: str, lang: str) -> str:
+    """Build personalized welcome message based on user role and access."""
+    accessible = get_accessible_patients(telegram_user_id)
+    role = get_user_role(telegram_user_id, patient_id)
+    patient_name = get_patient_name(patient_id) or "пациент"
+    user_name = get_user_name(telegram_user_id) or ""
+    has_multiple = len(accessible) > 1
+    is_patient = role == "patient"
+
+    if lang == "lt":
+        return _build_welcome_lt(user_name, patient_name, is_patient, has_multiple)
+
+    # --- Russian ---
+    lines = []
+
+    if is_patient:
+        greeting = f"Привет, {user_name}!" if user_name else "Привет!"
+        lines.append(f"{greeting} Я Mano — ваш личный медицинский помощник.")
+        lines.append("")
+        lines.append("Что я умею:")
+        lines.append("• Храню все ваши медицинские документы в одном месте")
+        lines.append("• Отвечаю на вопросы по анализам и диагнозам простым языком")
+        lines.append("• Слежу за динамикой показателей — увижу если что-то ухудшается")
+        lines.append("• Проверяю каждый новый рецепт на совместимость с вашими лекарствами и диагнозами")
+        lines.append("• Готовлю речь перед визитом к врачу — чтобы ничего не забыть")
+        lines.append("• В экстренной ситуации покажу карточку для скорой со всей важной информацией")
+    else:
+        greeting = f"Привет, {user_name}!" if user_name else "Привет!"
+        lines.append(f"{greeting} Я Mano — медицинский помощник для вашей семьи.")
+        lines.append("")
+        lines.append(f"Сейчас активный профиль: {patient_name}")
+        lines.append("")
+        lines.append("Вы можете помогать близкому человеку с медициной:")
+        lines.append("• Загружайте документы (фото, PDF, выписки) — я сохраню в базу знаний")
+        lines.append("• Спрашивайте что угодно по анализам и назначениям")
+        lines.append("• Сфотографируйте рецепт — проверю безопасность всех препаратов")
+        lines.append("• Перед визитом к врачу подготовлю речь с учётом всей истории")
+        lines.append("• В экстренной ситуации — /sos покажет карточку для скорой")
+
+    lines.append("")
+    lines.append("Как пользоваться:")
+    lines.append("• Просто напишите вопрос текстом или голосовым сообщением")
+    lines.append("• Отправьте документ или фото — я обработаю и добавлю в базу")
+    lines.append("• Запишите визит к врачу на диктофон — транскрибирую и проанализирую")
+    lines.append("")
+    lines.append("Команды:")
+    lines.append("/sos — карточка для скорой помощи")
+    lines.append("/doctor невролог — подготовить речь для врача")
+    lines.append("/labs — анализы и тренды")
+    lines.append("/meds — текущие лекарства")
+    lines.append("/profile — что я знаю о пациенте")
+    lines.append("/diary — дневник самочувствия")
+
+    if has_multiple:
+        lines.append("/switch — переключить профиль пациента")
+
+    lines.append("")
+    lines.append("Я не ставлю диагнозы и не заменяю врача.")
+
+    return "\n".join(lines)
+
+
+def _build_welcome_lt(user_name: str, patient_name: str, is_patient: bool, has_multiple: bool) -> str:
+    """Lithuanian welcome message."""
+    lines = []
+    greeting = f"Sveiki, {user_name}!" if user_name else "Sveiki!"
+
+    if is_patient:
+        lines.append(f"{greeting} Aš Mano — jūsų asmeninis medicininis asistentas.")
+        lines.append("")
+        lines.append("Ką galiu:")
+        lines.append("• Saugau visus jūsų medicininius dokumentus vienoje vietoje")
+        lines.append("• Atsakau į klausimus apie tyrimus ir diagnozes paprastai")
+        lines.append("• Seku rodiklių dinamiką — pastebėsiu jei kas blogėja")
+        lines.append("• Tikrinu kiekvieną naują receptą dėl suderinamumo")
+        lines.append("• Paruošiu kalbą prieš vizitą pas gydytoją")
+        lines.append("• Skubiu atveju — kortelė greitajai su visa svarbia informacija")
+    else:
+        lines.append(f"{greeting} Aš Mano — medicininis asistentas jūsų šeimai.")
+        lines.append("")
+        lines.append(f"Aktyvus profilis: {patient_name}")
+        lines.append("")
+        lines.append("Galite padėti artimam žmogui su medicina:")
+        lines.append("• Siųskite dokumentus — išsaugosiu žinių bazėje")
+        lines.append("• Klauskite bet ką apie tyrimus ir paskyrimus")
+        lines.append("• Nufotografuokite receptą — patikrinsiu saugumą")
+        lines.append("• Prieš vizitą pas gydytoją paruošiu kalbą")
+        lines.append("• Skubiu atveju — /sos parodys kortelę greitajai")
+
+    lines.append("")
+    lines.append("Kaip naudotis:")
+    lines.append("• Rašykite klausimą tekstu arba balso žinute")
+    lines.append("• Siųskite dokumentą ar nuotrauką — apdorosiu ir pridėsiu")
+    lines.append("• Įrašykite vizitą pas gydytoją — transkribuosiu ir analizuosiu")
+    lines.append("")
+    lines.append("Komandos:")
+    lines.append("/sos — kortelė greitajai pagalbai")
+    lines.append("/doctor neurologas — paruošti kalbą gydytojui")
+    lines.append("/labs — tyrimai ir tendencijos")
+    lines.append("/meds — dabartiniai vaistai")
+    lines.append("/profile — ką žinau apie pacientą")
+    lines.append("/diary — savijautos dienoraštis")
+
+    if has_multiple:
+        lines.append("/switch — perjungti paciento profilį")
+
+    lines.append("")
+    lines.append("Nediagnozuoju ir nepakeičiu gydytojo.")
+
+    return "\n".join(lines)
 
 
 def _get_lang(patient_id: str) -> str:
@@ -391,12 +459,56 @@ async def _ask_and_reply(
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
-    patient_id = _check_access(update.effective_user.id)
+    user_id = update.effective_user.id
+    patient_id = _check_access(user_id)
     if not patient_id:
         await update.message.reply_text(NOT_REGISTERED_TEXT)
         return
+
     lang = _get_lang(patient_id)
-    await update.message.reply_text(WELCOME_TEXT.get(lang, WELCOME_TEXT["ru"]))
+    welcome = _build_welcome(user_id, patient_id, lang)
+    await update.message.reply_text(welcome)
+
+
+async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /switch — switch active patient for multi-patient users."""
+    user_id = update.effective_user.id
+    accessible = get_accessible_patients(user_id)
+
+    if not accessible:
+        await update.message.reply_text(NOT_REGISTERED_TEXT)
+        return
+
+    if len(accessible) == 1:
+        pid = list(accessible.keys())[0]
+        name = get_patient_name(pid) or pid
+        await update.message.reply_text(f"У вас один пациент: {name}")
+        return
+
+    # If argument given — switch directly
+    args = context.args
+    if args:
+        target = args[0].lower()
+        if target in accessible:
+            set_active_patient(user_id, target)
+            name = get_patient_name(target) or target
+            role = accessible[target]
+            role_label = "вы пациент" if role == "patient" else "вы родственник"
+            await update.message.reply_text(f"Переключено на: {name} ({role_label})")
+            return
+        else:
+            await update.message.reply_text(f"Пациент '{target}' не найден. Доступные ниже.")
+
+    # Show list
+    current = get_patient_id_by_telegram(user_id)
+    lines = ["Доступные пациенты:\n"]
+    for pid, role in accessible.items():
+        name = get_patient_name(pid) or pid
+        role_label = "пациент" if role == "patient" else "родственник"
+        marker = " ← сейчас" if pid == current else ""
+        lines.append(f"  /switch {pid} — {name} ({role_label}){marker}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,7 +712,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not question:
         return
 
-    role = get_user_role(user_id)
+    role = get_user_role(user_id, patient_id)
 
     # Auto-detect doctor visit — prepare speech automatically
     doctor_specialty = _detect_doctor_visit(question)
@@ -659,7 +771,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{'Atpažinta' if lang == 'lt' else 'Распознано'}: {text}")
 
         # Auto-detect health status and save to diary
-        role = get_user_role(user_id)
+        role = get_user_role(user_id, patient_id)
         if is_health_status(text):
             if role == "patient":
                 entry = save_entry(text, patient_id=patient_id)
@@ -922,6 +1034,7 @@ def main():
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("labs", cmd_labs))
