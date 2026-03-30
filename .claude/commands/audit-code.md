@@ -1,13 +1,13 @@
 ---
 name: audit-code
 description: >
-  Code Auditor для Medical Assistant Olga. Проверяет безопасность данных
+  Code Auditor для Mano. Проверяет безопасность данных
   пациента, надёжность пайплайна (OCR, Whisper, Claude API, ChromaDB),
   корректность Telegram-бота. Триггеры: /audit-code, перед деплоем,
   после добавления нового модуля, после инцидента.
 ---
 
-# Code Auditor — Medical Assistant Olga
+# Code Auditor — Mano
 
 ## Роль
 
@@ -136,7 +136,7 @@ grep -n "EMERGENCY\|SOS\|HOSPITAL" src/emergency_card.py
 
 ```
 ═══════════════════════════════════════════════
-CODE AUDIT — Medical Assistant Olga — [дата]
+CODE AUDIT — Mano — [дата]
 ═══════════════════════════════════════════════
 
 ИТОГ: [БЕЗОПАСНО / РИСКИ НАЙДЕНЫ / СТОП]

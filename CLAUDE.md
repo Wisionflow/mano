@@ -1,9 +1,10 @@
-# Medical Assistant — Claude Code Guide
+# Mano — Claude Code Guide
 
 ## Project Purpose
-Multi-patient medical AI assistant. Processes medical documents (PDFs, photos,
-scans, Excel), enables Q&A over full health history, tracks medications and lab
-values, verifies drug safety across all diagnoses, and prepares for doctor visits.
+**Mano** — multi-patient medical AI assistant. Processes medical documents (PDFs,
+photos, scans, Excel), enables Q&A over full health history, tracks medications
+and lab values, verifies drug safety across all diagnoses, and prepares for
+doctor visits. Telegram bot: @mano_med_bot
 
 ## Architecture: Multi-Patient
 Each patient has isolated data under `data/patients/{patient_id}/`:
@@ -30,7 +31,7 @@ Patient registry: `data/patient_registry.json` — maps Telegram user IDs to pat
 
 ## Project Structure
 ```
-medical-assistant-olga/
+mano/
 ├── CLAUDE.md               ← you are here
 ├── .env                    ← API keys (never commit)
 ├── requirements.txt

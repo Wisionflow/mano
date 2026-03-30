@@ -1,4 +1,4 @@
-"""Register patients for the multi-patient medical assistant.
+"""Register patients for Mano — multi-patient medical assistant.
 
 Run once to set up patient registry, then start the bot.
 

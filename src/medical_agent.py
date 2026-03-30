@@ -1,4 +1,4 @@
-"""Medical AI agent powered by Claude for Q&A over patient documents.
+"""Mano — medical AI agent powered by Claude for Q&A over patient documents.
 
 Supports multi-patient: pass patient_id to constructor for isolated data.
 Legacy mode (no patient_id) uses the original med_docs_olga/ MEDICAL_SUMMARY.md.
@@ -22,7 +22,7 @@ _MEDICAL_SUMMARY = ""
 if _SUMMARY_PATH.exists():
     _MEDICAL_SUMMARY = _SUMMARY_PATH.read_text(encoding="utf-8")
 
-SYSTEM_PROMPT = """Ты — персональный медицинский ассистент. Твоя задача — помогать разобраться
+SYSTEM_PROMPT = """Ты — Mano, персональный медицинский помощник. Твоя задача — помогать разобраться
 в медицинских документах, анализах и истории лечения конкретного пациента.
 
 ВАЖНЕЙШЕЕ ПРАВИЛО — ПРОВЕРКА ЛЕКАРСТВ:

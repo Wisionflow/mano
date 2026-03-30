@@ -1,4 +1,4 @@
-"""Main Gradio web application for the medical assistant."""
+"""Main Gradio web application for Mano — personal medical assistant."""
 
 import os
 import tempfile

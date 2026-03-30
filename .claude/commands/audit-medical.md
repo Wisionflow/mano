@@ -1,14 +1,14 @@
 ---
 name: audit-medical
 description: >
-  Medical Content Auditor для Medical Assistant Olga. Проверяет актуальность
+  Medical Content Auditor для Mano. Проверяет актуальность
   медицинских данных: препараты, диагнозы, аллергии, /sos и /hospital карточки,
   MEDICAL_SUMMARY.md, лабораторные значения в трекере, дневник, расхождения
   с ЕМИАС. Триггеры: /audit-medical, после нового визита к врачу, после
   добавления новых документов, раз в месяц.
 ---
 
-# Medical Content Auditor — Medical Assistant Olga
+# Medical Content Auditor — Mano
 
 ## Роль
 

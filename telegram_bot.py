@@ -1,4 +1,4 @@
-"""Telegram bot interface for the medical assistant."""
+"""Telegram bot interface for Mano — personal medical assistant."""
 
 import os
 import tempfile
@@ -77,7 +77,7 @@ def _resolve_patient(telegram_user_id: int) -> str | None:
 
 WELCOME_TEXT = {
     "ru": (
-        "Привет! Я твой медицинский ассистент.\n\n"
+        "Привет! Я Mano — твой медицинский помощник.\n\n"
         "Я могу:\n"
         "- Отвечать на вопросы по твоим анализам и документам\n"
         "- Объяснять медицинские термины простым языком\n"
@@ -100,7 +100,7 @@ WELCOME_TEXT = {
         "⚠️ Я не ставлю диагнозы и не заменяю врача."
     ),
     "lt": (
-        "Sveiki! Aš jūsų medicininis asistentas.\n\n"
+        "Sveiki! Aš Mano — jūsų medicininis asistentas.\n\n"
         "Galiu:\n"
         "- Atsakyti į klausimus apie jūsų tyrimus ir dokumentus\n"
         "- Paaiškinti medicininius terminus paprastai\n"
