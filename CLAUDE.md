@@ -99,8 +99,13 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 ```
 
 ## Telegram Bot Commands
-- **/start** — welcome message (shows active patient if multi-access)
-- **/switch [patient_id]** — switch active patient (for users with multi-patient access)
+- **/start** — registration (new users) or welcome (existing). Deep link: `/start inv_TOKEN`
+- **/me** — create own medical profile (for users registered only as family)
+- **/newpatient** — create profile for a family member
+- **/invite [владелец]** — generate invite link (family or owner role)
+- **/access** — show who has access to current patient
+- **/revoke [id/name]** — owner removes someone's access
+- **/switch [patient_id]** — switch active patient
 - **/sos** — emergency card for paramedics (dynamic from profile)
 - **/hospital** — full summary for ER admission
 - **/doctor [specialty]** — speech for doctor visit (healthcare-system-aware)
@@ -122,15 +127,30 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 - **Audio files** → full visit transcription + analysis
 - **Lab values from photos** → auto-extract to tracker
 
-## Multi-Patient Flow
-- **Registry v2** (`data/patient_registry.json`): one user → multiple patients with roles
-- Each user has `patients: {patient_id: role}` where role = "patient" | "family"
+## Access Control (Registry v3)
+- **Registry v3** (`data/patient_registry.json`): role-based access + invite system
+- Roles: `owner` (patient — admin of their data) | `family` (caregiver)
+- **Self-registration**: new user sends /start → creates own profile as owner
+- **Invite system**: /invite generates deep-link `t.me/bot?start=inv_TOKEN`
+  - Owner invites family members
+  - Family (if no owner yet) can invite the actual patient as owner
+- **Owner becomes admin**: can /revoke anyone's access
+- No whitelist (TELEGRAM_ALLOWED_USERS removed) — access via registry only
 - `default_patient` sets which patient is active on bot start
 - **/switch** lets users change active patient at runtime (in-memory)
 - Each patient gets isolated VectorStore, MedicalAgent, diary, labs, meds
 - Profile builds incrementally from uploaded documents
 - System prompt includes: patient profile + healthcare system + medications + diary + conversation history
-- **Caregiver pattern**: a family member (e.g. husband) manages patient's data without being a patient themselves
+
+## Docker Deploy
+```bash
+docker compose build
+docker compose up -d
+docker logs -f mano_bot
+```
+- Dockerfile: Python 3.11-slim + ffmpeg + tesseract-ocr-rus
+- Data persisted via volume: `./data:/app/data`
+- Whisper runs on CPU (no GPU) — voice ETA shown to user
 
 ## Supported Languages
 - **ru** — Russian (full support)
