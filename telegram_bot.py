@@ -36,6 +36,16 @@ from src.patient_manager import (
     load_profile,
     build_emergency_card,
     add_patient_access,
+    is_registered,
+    create_self_patient,
+    create_patient_for_other,
+    create_invite,
+    accept_invite,
+    revoke_access,
+    get_patient_access_list,
+    is_owner,
+    patient_has_owner,
+    update_user_name,
 )
 from src.profile_extractor import process_document_for_profile
 from src.medication_tracker import (
@@ -52,6 +62,11 @@ logger = logging.getLogger(__name__)
 
 # --- Config ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_NAME = os.getenv("TELEGRAM_BOT_NAME", "mano_med_bot")
+
+# --- Registration state (in-memory, pending registrations) ---
+# telegram_user_id → {"state": "awaiting_name"|"awaiting_newpatient_name", ...}
+_pending_action: dict[int, dict] = {}
 
 # --- Multi-patient state ---
 # Each patient gets their own VectorStore + MedicalAgent, cached by patient_id
@@ -80,8 +95,8 @@ def _resolve_patient(telegram_user_id: int) -> str | None:
     return get_patient_id_by_telegram(telegram_user_id)
 
 NOT_REGISTERED_TEXT = (
-    "Вы не зарегистрированы. Обратитесь к администратору.\n"
-    "You are not registered. Contact the administrator."
+    "Вы ещё не зарегистрированы. Отправьте /start чтобы начать.\n"
+    "You are not registered yet. Send /start to begin."
 )
 
 
@@ -92,7 +107,8 @@ def _build_welcome(telegram_user_id: int, patient_id: str, lang: str) -> str:
     patient_name = get_patient_name(patient_id) or "пациент"
     user_name = get_user_name(telegram_user_id) or ""
     has_multiple = len(accessible) > 1
-    is_patient = role == "patient"
+    is_patient = role == "owner"
+    logger.info("_build_welcome: tg_id=%s user_name=%s role=%s patient_id=%s", telegram_user_id, user_name, role, patient_id)
 
     if lang == "lt":
         return _build_welcome_lt(user_name, patient_name, is_patient, has_multiple)
@@ -137,9 +153,11 @@ def _build_welcome(telegram_user_id: int, patient_id: str, lang: str) -> str:
     lines.append("/meds — текущие лекарства")
     lines.append("/profile — что я знаю о пациенте")
     lines.append("/diary — дневник самочувствия")
-
-    if has_multiple:
-        lines.append("/switch — переключить профиль пациента")
+    lines.append("/switch — переключить профиль пациента")
+    lines.append("/me — создать свой медицинский профиль")
+    lines.append("/newpatient — добавить профиль близкого")
+    lines.append("/invite — пригласить человека к профилю")
+    lines.append("/access — кто имеет доступ")
 
     lines.append("")
     lines.append("Я не ставлю диагнозы и не заменяю врача.")
@@ -188,8 +206,10 @@ def _build_welcome_lt(user_name: str, patient_name: str, is_patient: bool, has_m
     lines.append("/profile — ką žinau apie pacientą")
     lines.append("/diary — savijautos dienoraštis")
 
-    if has_multiple:
-        lines.append("/switch — perjungti paciento profilį")
+    lines.append("/switch — perjungti paciento profilį")
+    lines.append("/newpatient — pridėti artimojo profilį")
+    lines.append("/invite — pakviesti žmogų prie profilio")
+    lines.append("/access — kas turi prieigą")
 
     lines.append("")
     lines.append("Nediagnozuoju ir nepakeičiu gydytojo.")
@@ -434,9 +454,12 @@ async def _ask_and_reply(
     update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, patient_id: str
 ):
     """Common logic: send question to agent, reply with answer."""
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="typing"
+        )
+    except Exception:
+        pass  # non-critical, continue even if typing indicator fails
 
     try:
         agent = _get_agent(patient_id)
@@ -450,24 +473,218 @@ async def _ask_and_reply(
                 await update.message.reply_text(answer[i : i + 4096])
     except Exception as e:
         logger.error("Error answering question: %s", e, exc_info=True)
-        await update.message.reply_text(
-            "Произошла ошибка при обработке вопроса. Попробуй позже."
-        )
+        try:
+            await update.message.reply_text(
+                "Произошла ошибка при обработке вопроса. Попробуй позже."
+            )
+        except Exception:
+            pass
 
 
 # --- Handlers ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
+    """Handle /start — registration or welcome. Deep link: /start inv_TOKEN."""
+    user_id = update.effective_user.id
+    args = context.args
+
+    # --- Deep link: invite acceptance ---
+    if args and args[0].startswith("inv_"):
+        token = args[0][4:]
+        tg_name = update.effective_user.first_name or ""
+        result = accept_invite(user_id, token, user_name=tg_name)
+        if result:
+            role_label = "владелец" if result["role"] == "owner" else "родственник"
+            await update.message.reply_text(
+                f"Вы подключены к профилю: {result['patient_name']} ({role_label}).\n\n"
+                "Используйте /switch для переключения между профилями."
+            )
+            # If this is their first patient, also show welcome
+            patient_id = get_patient_id_by_telegram(user_id)
+            if patient_id:
+                lang = _get_lang(patient_id)
+                welcome = _build_welcome(user_id, patient_id, lang)
+                await update.message.reply_text(welcome)
+            return
+        else:
+            await update.message.reply_text(
+                "Ссылка-приглашение недействительна или уже использована."
+            )
+            return
+
+    # --- Already registered — show welcome ---
+    if is_registered(user_id):
+        patient_id = get_patient_id_by_telegram(user_id)
+        if patient_id:
+            # Always sync name from Telegram
+            tg_name = update.effective_user.first_name or ""
+            if tg_name:
+                update_user_name(user_id, tg_name)
+            lang = _get_lang(patient_id)
+            logger.info("cmd_start: user_id=%s tg_name=%s patient_id=%s", user_id, tg_name, patient_id)
+            welcome = _build_welcome(user_id, patient_id, lang)
+            await update.message.reply_text(welcome)
+            return
+
+    # --- New user — start registration ---
+    _pending_action[user_id] = {"state": "awaiting_name"}
+    await update.message.reply_text(
+        "Добро пожаловать в Mano — ваш личный медицинский помощник!\n\n"
+        "Как вас зовут? (Имя или Имя Фамилия)"
+    )
+
+
+async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /me — create own patient profile (for users who are only family)."""
+    user_id = update.effective_user.id
+
+    # Check if user already has own profile (is owner of any patient)
+    accessible = get_accessible_patients(user_id)
+    for pid, role in accessible.items():
+        if role == "owner":
+            await update.message.reply_text(
+                f"У вас уже есть свой профиль: {get_patient_name(pid) or pid}\n"
+                f"Переключиться: /switch {pid}"
+            )
+            return
+
+    _pending_action[user_id] = {"state": "awaiting_own_profile_name"}
+    await update.message.reply_text(
+        "Создаём ваш личный медицинский профиль.\n"
+        "Как вас зовут? (Имя или ФИО)"
+    )
+
+
+async def cmd_newpatient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /newpatient — create a patient profile for a family member."""
+    user_id = update.effective_user.id
+    if not is_registered(user_id):
+        await update.message.reply_text("Сначала зарегистрируйтесь: /start")
+        return
+
+    _pending_action[user_id] = {"state": "awaiting_newpatient_name"}
+    await update.message.reply_text(
+        "Создаём профиль для близкого человека.\n"
+        "Как зовут пациента? (Имя или ФИО)"
+    )
+
+
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /invite — generate invite link for current patient profile."""
     user_id = update.effective_user.id
     patient_id = _check_access(user_id)
     if not patient_id:
-        await update.message.reply_text(NOT_REGISTERED_TEXT)
         return
 
-    lang = _get_lang(patient_id)
-    welcome = _build_welcome(user_id, patient_id, lang)
-    await update.message.reply_text(welcome)
+    patient_name = get_patient_name(patient_id) or patient_id
+    has_owner = patient_has_owner(patient_id)
+
+    args = context.args
+    role = "family"
+    if args and args[0].lower() in ("owner", "владелец"):
+        if has_owner:
+            await update.message.reply_text(
+                f"У профиля «{patient_name}» уже есть владелец. "
+                "Пригласить можно только как родственника."
+            )
+            return
+        role = "owner"
+
+    token = create_invite(user_id, patient_id, role=role)
+    if not token:
+        await update.message.reply_text("Не удалось создать приглашение.")
+        return
+
+    link = f"https://t.me/{BOT_NAME}?start=inv_{token}"
+    role_label = "владелец (администратор)" if role == "owner" else "родственник"
+
+    lines = [
+        f"Приглашение для профиля «{patient_name}» (роль: {role_label}):",
+        "",
+        f"{link}",
+        "",
+        "Отправьте эту ссылку человеку. После перехода он получит доступ.",
+    ]
+    if not has_owner:
+        lines.append("")
+        lines.append("Чтобы пригласить самого пациента как владельца:")
+        lines.append("/invite владелец")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /access — show who has access to current patient."""
+    user_id = update.effective_user.id
+    patient_id = _check_access(user_id)
+    if not patient_id:
+        return
+
+    patient_name = get_patient_name(patient_id) or patient_id
+    access_list = get_patient_access_list(patient_id)
+
+    lines = [f"Доступ к профилю «{patient_name}»:\n"]
+    for entry in access_list:
+        role = entry["role"]
+        name = entry["name"] or f"ID:{entry['telegram_id']}"
+        role_label = "👑 владелец" if role == "owner" else "👥 родственник"
+        lines.append(f"  {role_label} — {name}")
+
+    user_is_owner = is_owner(user_id, patient_id)
+    if user_is_owner and len(access_list) > 1:
+        lines.append("")
+        lines.append("Вы владелец. Чтобы отключить доступ:")
+        lines.append("/revoke <имя или ID>")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /revoke — owner removes someone's access."""
+    user_id = update.effective_user.id
+    patient_id = _check_access(user_id)
+    if not patient_id:
+        return
+
+    if not is_owner(user_id, patient_id):
+        await update.message.reply_text("Только владелец профиля может управлять доступом.")
+        return
+
+    args = context.args
+    if not args:
+        # Show list of who can be revoked
+        access_list = get_patient_access_list(patient_id)
+        others = [e for e in access_list if e["telegram_id"] != str(user_id)]
+        if not others:
+            await update.message.reply_text("Кроме вас никто не имеет доступа.")
+            return
+        lines = ["Кого отключить?\n"]
+        for entry in others:
+            name = entry["name"] or f"ID:{entry['telegram_id']}"
+            lines.append(f"  /revoke {entry['telegram_id']} — {name}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    target = args[0]
+    # Try to find by name or telegram_id
+    access_list = get_patient_access_list(patient_id)
+    target_id = None
+    for entry in access_list:
+        if entry["telegram_id"] == target:
+            target_id = int(target)
+            break
+        if entry["name"].lower() == target.lower():
+            target_id = int(entry["telegram_id"])
+            break
+
+    if not target_id:
+        await update.message.reply_text(f"Пользователь '{target}' не найден среди имеющих доступ.")
+        return
+
+    if revoke_access(user_id, patient_id, target_id):
+        await update.message.reply_text("Доступ отключён.")
+    else:
+        await update.message.reply_text("Не удалось отключить доступ.")
 
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,7 +699,10 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(accessible) == 1:
         pid = list(accessible.keys())[0]
         name = get_patient_name(pid) or pid
-        await update.message.reply_text(f"У вас один пациент: {name}")
+        await update.message.reply_text(
+            f"У вас один профиль: {name}\n\n"
+            "Чтобы добавить близкого: /newpatient"
+        )
         return
 
     # If argument given — switch directly
@@ -493,21 +713,23 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_active_patient(user_id, target)
             name = get_patient_name(target) or target
             role = accessible[target]
-            role_label = "вы пациент" if role == "patient" else "вы родственник"
+            role_label = "вы владелец" if role == "owner" else "вы родственник"
             await update.message.reply_text(f"Переключено на: {name} ({role_label})")
             return
         else:
-            await update.message.reply_text(f"Пациент '{target}' не найден. Доступные ниже.")
+            await update.message.reply_text(f"Профиль '{target}' не найден.")
 
     # Show list
     current = get_patient_id_by_telegram(user_id)
-    lines = ["Доступные пациенты:\n"]
+    lines = ["Доступные профили:\n"]
     for pid, role in accessible.items():
         name = get_patient_name(pid) or pid
-        role_label = "пациент" if role == "patient" else "родственник"
+        role_label = "👑 владелец" if role == "owner" else "👥 родственник"
         marker = " ← сейчас" if pid == current else ""
         lines.append(f"  /switch {pid} — {name} ({role_label}){marker}")
 
+    lines.append("")
+    lines.append("Добавить близкого: /newpatient")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -702,15 +924,69 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular text messages — Q&A."""
+    """Handle regular text messages — registration flow or Q&A."""
     user_id = update.effective_user.id
-    patient_id = _check_access(user_id)
-    if not patient_id:
+    text = update.message.text.strip()
+    if not text:
         return
 
-    question = update.message.text.strip()
-    if not question:
+    # --- Handle pending registration / newpatient ---
+    pending = _pending_action.get(user_id)
+    if pending:
+        if pending["state"] == "awaiting_name":
+            del _pending_action[user_id]
+            name = text
+            patient_id = create_self_patient(user_id, name)
+            # Update user name from input
+            update_user_name(user_id, name)
+            lang = _get_lang(patient_id)
+            await update.message.reply_text(
+                f"Профиль создан: {name}\n\n"
+                "Теперь вы можете:\n"
+                "• Отправить медицинский документ (фото, PDF) — я сохраню в вашу базу\n"
+                "• Задать вопрос о здоровье\n"
+                "• Создать профиль для близкого: /newpatient\n\n"
+                "Команды: /sos /doctor /labs /meds /diary /profile"
+            )
+            return
+
+        if pending["state"] == "awaiting_own_profile_name":
+            del _pending_action[user_id]
+            name = text
+            patient_id = create_self_patient(user_id, name)
+            update_user_name(user_id, name)
+            set_active_patient(user_id, patient_id)
+            await update.message.reply_text(
+                f"Ваш профиль создан: {name}\n\n"
+                "Теперь вы можете загружать свои медицинские документы.\n"
+                "Переключиться между профилями: /switch"
+            )
+            return
+
+        if pending["state"] == "awaiting_newpatient_name":
+            del _pending_action[user_id]
+            patient_name = text
+            patient_id = create_patient_for_other(user_id, patient_name)
+            # Auto-switch to the new patient
+            set_active_patient(user_id, patient_id)
+            await update.message.reply_text(
+                f"Профиль «{patient_name}» создан. Вы — родственник-управляющий.\n\n"
+                "Загружайте медицинские документы — я сохраню в базу знаний.\n\n"
+                "Чтобы пригласить самого пациента как владельца:\n"
+                "/invite владелец\n\n"
+                "Чтобы пригласить другого родственника:\n"
+                "/invite\n\n"
+                "Переключиться обратно на свой профиль: /switch"
+            )
+            return
+
+    # --- Normal flow: Q&A ---
+    patient_id = _check_access(user_id)
+    if not patient_id:
+        await update.message.reply_text(NOT_REGISTERED_TEXT)
         return
+
+    question = text
 
     role = get_user_role(user_id, patient_id)
 
@@ -755,11 +1031,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lang = _get_lang(patient_id)
-    await update.message.reply_text("Klausau..." if lang == "lt" else "Слушаю...")
+    voice = update.message.voice
+    dur = voice.duration or 0
+    if dur > 15:
+        eta = max(1, dur // 5)
+        note = (
+            f"Klausau... Garso atpažinimas užtruks ~{eta} min."
+            if lang == "lt"
+            else f"Слушаю... Расшифровка займёт ~{eta} мин."
+        )
+    else:
+        note = "Klausau..." if lang == "lt" else "Слушаю..."
+    await update.message.reply_text(note)
 
     tmp_path = None
     try:
-        voice = update.message.voice
         tg_file = await voice.get_file()
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -880,9 +1166,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     duration_str = f" ({duration // 60}:{duration % 60:02d})" if duration else ""
+    eta = max(1, duration // 5) if duration else None
+    eta_str = f"\n⏱ Примерное время: ~{eta} мин." if eta else ""
     await update.message.reply_text(
-        f"Транскрибирую {file_name}{duration_str}...\n"
-        "Это может занять несколько минут для длинных записей."
+        f"Транскрибирую {file_name}{duration_str}...{eta_str}"
     )
 
     tmp_path = None
@@ -1035,6 +1322,11 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("switch", cmd_switch))
+    app.add_handler(CommandHandler("me", cmd_me))
+    app.add_handler(CommandHandler("newpatient", cmd_newpatient))
+    app.add_handler(CommandHandler("invite", cmd_invite))
+    app.add_handler(CommandHandler("access", cmd_access))
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("labs", cmd_labs))
