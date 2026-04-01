@@ -2,7 +2,11 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.example
 .git/
+.vscode/
+.claude/
+.pytest_cache/
 med_docs_olga/
 data/
 logs/

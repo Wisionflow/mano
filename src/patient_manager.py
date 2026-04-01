@@ -14,11 +14,15 @@ Each patient has their own directory under data/patients/{patient_id}/ with:
 
 import json
 import logging
+import re
 import secrets
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from filelock import FileLock
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +32,40 @@ DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "patients"
 # Patient registry — maps telegram_user_id to patient_id
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "data" / "patient_registry.json"
 
+# Audit log — append-only JSONL file for all access events
+AUDIT_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "audit.jsonl"
+
 CURRENT_VERSION = 3
 
 
+def audit_log(telegram_user_id: int, patient_id: str, action: str, details: str = ""):
+    """Append an audit entry (JSONL). Non-blocking, best-effort."""
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = json.dumps({
+            "ts": datetime.now().isoformat(),
+            "user": telegram_user_id,
+            "patient": patient_id,
+            "action": action,
+            "details": details[:500],
+        }, ensure_ascii=False)
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception as e:
+        logger.warning("Audit log write failed: %s", e)
+
+
+# File lock for registry — prevents race conditions on concurrent access
+_registry_lock = FileLock(str(REGISTRY_PATH) + ".lock", timeout=10)
+
+# Empty registry template
+_EMPTY_REGISTRY = {"version": CURRENT_VERSION, "patients": {}, "access": {}, "invites": {}}
+
+
 def _load_registry() -> dict:
-    """Load patient registry (v3: owner/family roles, invites)."""
+    """Load patient registry (v3: owner/family roles, invites). Must be called under _registry_lock."""
     if not REGISTRY_PATH.exists():
-        return {"version": CURRENT_VERSION, "patients": {}, "access": {}, "invites": {}}
+        return {**_EMPTY_REGISTRY}
     try:
         data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
         version = data.get("version", 1)
@@ -45,7 +76,16 @@ def _load_registry() -> dict:
             _save_registry(data)
         return data
     except (json.JSONDecodeError, ValueError):
-        return {"version": CURRENT_VERSION, "patients": {}, "access": {}, "invites": {}}
+        logger.error("Registry corrupted, attempting backup restore")
+        backup = Path(str(REGISTRY_PATH) + ".backup")
+        if backup.exists():
+            try:
+                data = json.loads(backup.read_text(encoding="utf-8"))
+                logger.info("Registry restored from backup")
+                return data
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return {**_EMPTY_REGISTRY}
 
 
 def _migrate_registry_v1_to_v2(old: dict) -> dict:
@@ -71,23 +111,33 @@ def _migrate_registry_v2_to_v3(old: dict) -> dict:
         "access": old.get("access", {}),
         "invites": {},
     }
-    # For each patient, find who has role "patient" and make them "owner"
     for tg_id, access_entry in new["access"].items():
         patients = access_entry.get("patients", {})
         for pid, role in list(patients.items()):
             if role == "patient":
                 patients[pid] = "owner"
-                # Set owner on the patient record
                 if pid in new["patients"]:
                     new["patients"][pid].setdefault("owner", tg_id)
     return new
 
 
 def _save_registry(registry: dict):
+    """Save registry atomically: write to temp → backup old → rename. Must be called under _registry_lock."""
     REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REGISTRY_PATH.write_text(
+    tmp_path = REGISTRY_PATH.with_suffix(".tmp")
+    backup_path = Path(str(REGISTRY_PATH) + ".backup")
+    # Write to temp file first
+    tmp_path.write_text(
         json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    # Backup current version
+    if REGISTRY_PATH.exists():
+        try:
+            REGISTRY_PATH.replace(backup_path)
+        except OSError:
+            pass
+    # Atomic rename
+    tmp_path.replace(REGISTRY_PATH)
 
 
 # --- Self-registration ---
@@ -99,34 +149,32 @@ def create_self_patient(
     healthcare_system: str = "russia_moscow",
 ) -> str:
     """Create a personal patient profile for a new user. Returns patient_id."""
-    registry = _load_registry()
-    tg_key = str(telegram_user_id)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(telegram_user_id)
 
-    # Generate patient_id from name (slug)
-    patient_id = _generate_patient_id(name, registry)
+        patient_id = _generate_patient_id(name, registry)
 
-    # Create patient record
-    registry["patients"][patient_id] = {
-        "name": name,
-        "language": language,
-        "healthcare_system": healthcare_system,
-        "owner": tg_key,
-        "created_by": tg_key,
-        "created": datetime.now().isoformat(),
-    }
-
-    # Create access entry
-    if tg_key not in registry["access"]:
-        registry["access"][tg_key] = {
+        registry["patients"][patient_id] = {
             "name": name,
-            "patients": {},
-            "default_patient": patient_id,
+            "language": language,
+            "healthcare_system": healthcare_system,
+            "owner": tg_key,
+            "created_by": tg_key,
+            "created": datetime.now().isoformat(),
         }
-    registry["access"][tg_key]["patients"][patient_id] = "owner"
-    if not registry["access"][tg_key].get("default_patient"):
-        registry["access"][tg_key]["default_patient"] = patient_id
 
-    _save_registry(registry)
+        if tg_key not in registry["access"]:
+            registry["access"][tg_key] = {
+                "name": name,
+                "patients": {},
+                "default_patient": patient_id,
+            }
+        registry["access"][tg_key]["patients"][patient_id] = "owner"
+        if not registry["access"][tg_key].get("default_patient"):
+            registry["access"][tg_key]["default_patient"] = patient_id
+
+        _save_registry(registry)
 
     # Create patient directory structure
     patient_dir = get_patient_dir(patient_id)
@@ -138,6 +186,7 @@ def create_self_patient(
     save_profile(patient_id, profile)
     _init_conversation_db(patient_id)
 
+    audit_log(telegram_user_id, patient_id, "create_self_patient")
     logger.info("Self-registered patient '%s' (telegram_id=%s)", patient_id, telegram_user_id)
     return patient_id
 
@@ -149,32 +198,30 @@ def create_patient_for_other(
     healthcare_system: str = "russia_moscow",
 ) -> str:
     """Create a patient profile for someone else. Creator gets 'family' role. Returns patient_id."""
-    registry = _load_registry()
-    tg_key = str(creator_telegram_id)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(creator_telegram_id)
 
-    patient_id = _generate_patient_id(patient_name, registry)
+        patient_id = _generate_patient_id(patient_name, registry)
 
-    # Create patient record — no owner yet (will be set when patient joins via invite)
-    registry["patients"][patient_id] = {
-        "name": patient_name,
-        "language": language,
-        "healthcare_system": healthcare_system,
-        "owner": None,
-        "created_by": tg_key,
-        "created": datetime.now().isoformat(),
-    }
-
-    # Creator gets family role
-    if tg_key not in registry["access"]:
-        creator_name = ""  # will be set from telegram later
-        registry["access"][tg_key] = {
-            "name": creator_name,
-            "patients": {},
-            "default_patient": patient_id,
+        registry["patients"][patient_id] = {
+            "name": patient_name,
+            "language": language,
+            "healthcare_system": healthcare_system,
+            "owner": None,
+            "created_by": tg_key,
+            "created": datetime.now().isoformat(),
         }
-    registry["access"][tg_key]["patients"][patient_id] = "family"
 
-    _save_registry(registry)
+        if tg_key not in registry["access"]:
+            registry["access"][tg_key] = {
+                "name": "",
+                "patients": {},
+                "default_patient": patient_id,
+            }
+        registry["access"][tg_key]["patients"][patient_id] = "family"
+
+        _save_registry(registry)
 
     # Create patient directory
     patient_dir = get_patient_dir(patient_id)
@@ -185,6 +232,7 @@ def create_patient_for_other(
     save_profile(patient_id, profile)
     _init_conversation_db(patient_id)
 
+    audit_log(creator_telegram_id, patient_id, "create_patient_for_other")
     logger.info("Created patient '%s' for other (creator=%s)", patient_id, creator_telegram_id)
     return patient_id
 
@@ -234,34 +282,33 @@ def create_invite(
     role='owner' — invite the actual patient to become owner.
     role='family' — invite another family member.
     """
-    registry = _load_registry()
-    tg_key = str(creator_telegram_id)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(creator_telegram_id)
 
-    # Check creator has access
-    access = registry.get("access", {}).get(tg_key)
-    if not access or patient_id not in access.get("patients", {}):
-        return None
+        access = registry.get("access", {}).get(tg_key)
+        if not access or patient_id not in access.get("patients", {}):
+            return None
 
-    patient = registry.get("patients", {}).get(patient_id)
-    if not patient:
-        return None
+        patient = registry.get("patients", {}).get(patient_id)
+        if not patient:
+            return None
 
-    creator_role = access["patients"][patient_id]
+        creator_role = access["patients"][patient_id]
 
-    # Only owner can invite family. Family can invite owner (if no owner yet).
-    if role == "family" and creator_role not in ("owner", "family"):
-        return None
-    if role == "owner" and patient.get("owner"):
-        return None  # owner already exists
+        if role == "family" and creator_role not in ("owner", "family"):
+            return None
+        if role == "owner" and patient.get("owner"):
+            return None
 
-    token = secrets.token_urlsafe(12)
-    registry.setdefault("invites", {})[token] = {
-        "patient_id": patient_id,
-        "role": role,
-        "created_by": tg_key,
-        "created": datetime.now().isoformat(),
-    }
-    _save_registry(registry)
+        token = secrets.token_urlsafe(12)
+        registry.setdefault("invites", {})[token] = {
+            "patient_id": patient_id,
+            "role": role,
+            "created_by": tg_key,
+            "created": datetime.now().isoformat(),
+        }
+        _save_registry(registry)
 
     logger.info("Invite created for patient '%s' role=%s by %s", patient_id, role, tg_key)
     return token
@@ -273,42 +320,40 @@ def accept_invite(
     user_name: str = "",
 ) -> Optional[dict]:
     """Accept an invite. Returns {"patient_id", "role", "patient_name"} or None."""
-    registry = _load_registry()
-    tg_key = str(telegram_user_id)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(telegram_user_id)
 
-    invite = registry.get("invites", {}).get(token)
-    if not invite:
-        return None
+        invite = registry.get("invites", {}).get(token)
+        if not invite:
+            return None
 
-    patient_id = invite["patient_id"]
-    role = invite["role"]
+        patient_id = invite["patient_id"]
+        role = invite["role"]
 
-    patient = registry.get("patients", {}).get(patient_id)
-    if not patient:
-        return None
+        patient = registry.get("patients", {}).get(patient_id)
+        if not patient:
+            return None
 
-    # If role is owner and patient already has an owner — reject
-    if role == "owner" and patient.get("owner"):
-        return None
+        if role == "owner" and patient.get("owner"):
+            return None
 
-    # Add access
-    if tg_key not in registry["access"]:
-        registry["access"][tg_key] = {
-            "name": user_name,
-            "patients": {},
-            "default_patient": patient_id,
-        }
-    registry["access"][tg_key]["patients"][patient_id] = role
+        if tg_key not in registry["access"]:
+            registry["access"][tg_key] = {
+                "name": user_name,
+                "patients": {},
+                "default_patient": patient_id,
+            }
+        registry["access"][tg_key]["patients"][patient_id] = role
 
-    # Set owner on patient record
-    if role == "owner":
-        patient["owner"] = tg_key
+        if role == "owner":
+            patient["owner"] = tg_key
 
-    # Remove used invite
-    del registry["invites"][token]
+        del registry["invites"][token]
 
-    _save_registry(registry)
+        _save_registry(registry)
 
+    audit_log(telegram_user_id, patient_id, "accept_invite", f"role={role}")
     logger.info("Invite accepted: user %s → patient '%s' as %s", tg_key, patient_id, role)
     return {
         "patient_id": patient_id,
@@ -325,33 +370,32 @@ def revoke_access(
     target_telegram_id: int,
 ) -> bool:
     """Revoke access to a patient. Only owner can revoke. Returns True on success."""
-    registry = _load_registry()
+    with _registry_lock:
+        registry = _load_registry()
 
-    patient = registry.get("patients", {}).get(patient_id)
-    if not patient:
-        return False
+        patient = registry.get("patients", {}).get(patient_id)
+        if not patient:
+            return False
 
-    # Only owner can revoke
-    if patient.get("owner") != str(owner_telegram_id):
-        return False
+        if patient.get("owner") != str(owner_telegram_id):
+            return False
 
-    # Can't revoke yourself
-    if owner_telegram_id == target_telegram_id:
-        return False
+        if owner_telegram_id == target_telegram_id:
+            return False
 
-    target_key = str(target_telegram_id)
-    access = registry.get("access", {}).get(target_key)
-    if not access or patient_id not in access.get("patients", {}):
-        return False
+        target_key = str(target_telegram_id)
+        access = registry.get("access", {}).get(target_key)
+        if not access or patient_id not in access.get("patients", {}):
+            return False
 
-    del access["patients"][patient_id]
+        del access["patients"][patient_id]
 
-    # If this was their default, reset
-    if access.get("default_patient") == patient_id:
-        remaining = list(access["patients"].keys())
-        access["default_patient"] = remaining[0] if remaining else None
+        if access.get("default_patient") == patient_id:
+            remaining = list(access["patients"].keys())
+            access["default_patient"] = remaining[0] if remaining else None
 
-    _save_registry(registry)
+        _save_registry(registry)
+    audit_log(owner_telegram_id, patient_id, "revoke_access", f"target={target_telegram_id}")
     logger.info("Access revoked: user %s removed from patient '%s' by owner %s",
                 target_key, patient_id, owner_telegram_id)
     return True
@@ -401,40 +445,41 @@ def register_patient(
     family_members: dict = None,
 ) -> dict:
     """Register a new patient and create their data directory (legacy API)."""
-    registry = _load_registry()
-    tg_key = str(patient_telegram_id)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(patient_telegram_id)
 
-    registry["patients"][patient_id] = {
-        "name": name,
-        "language": language,
-        "healthcare_system": healthcare_system,
-        "owner": tg_key,
-        "created_by": tg_key,
-        "created": datetime.now().isoformat(),
-    }
-
-    if tg_key not in registry["access"]:
-        registry["access"][tg_key] = {
+        registry["patients"][patient_id] = {
             "name": name,
-            "patients": {},
-            "default_patient": patient_id,
+            "language": language,
+            "healthcare_system": healthcare_system,
+            "owner": tg_key,
+            "created_by": tg_key,
+            "created": datetime.now().isoformat(),
         }
-    registry["access"][tg_key]["patients"][patient_id] = "owner"
-    if not registry["access"][tg_key].get("default_patient"):
-        registry["access"][tg_key]["default_patient"] = patient_id
 
-    if family_members:
-        for tg_id, info in family_members.items():
-            fam_key = str(tg_id)
-            if fam_key not in registry["access"]:
-                registry["access"][fam_key] = {
-                    "name": info.get("name", ""),
-                    "patients": {},
-                    "default_patient": patient_id,
-                }
-            registry["access"][fam_key]["patients"][patient_id] = "family"
+        if tg_key not in registry["access"]:
+            registry["access"][tg_key] = {
+                "name": name,
+                "patients": {},
+                "default_patient": patient_id,
+            }
+        registry["access"][tg_key]["patients"][patient_id] = "owner"
+        if not registry["access"][tg_key].get("default_patient"):
+            registry["access"][tg_key]["default_patient"] = patient_id
 
-    _save_registry(registry)
+        if family_members:
+            for tg_id, info in family_members.items():
+                fam_key = str(tg_id)
+                if fam_key not in registry["access"]:
+                    registry["access"][fam_key] = {
+                        "name": info.get("name", ""),
+                        "patients": {},
+                        "default_patient": patient_id,
+                    }
+                registry["access"][fam_key]["patients"][patient_id] = "family"
+
+        _save_registry(registry)
 
     patient_dir = get_patient_dir(patient_id)
     (patient_dir / "documents").mkdir(parents=True, exist_ok=True)
@@ -448,8 +493,15 @@ def register_patient(
     return profile
 
 
+def _validate_patient_id(patient_id: str):
+    """Validate patient_id to prevent path traversal."""
+    if not patient_id or not re.match(r'^[a-z0-9_-]+$', patient_id):
+        raise ValueError(f"Invalid patient_id: {patient_id!r}")
+
+
 def get_patient_dir(patient_id: str) -> Path:
     """Get the data directory for a patient."""
+    _validate_patient_id(patient_id)
     return DATA_ROOT / patient_id
 
 
@@ -517,12 +569,13 @@ def get_user_name(telegram_user_id: int) -> Optional[str]:
 
 def update_user_name(telegram_user_id: int, name: str):
     """Update display name for a user in registry."""
-    registry = _load_registry()
-    tg_key = str(telegram_user_id)
-    access = registry.get("access", {}).get(tg_key)
-    if access:
-        access["name"] = name
-        _save_registry(registry)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(telegram_user_id)
+        access = registry.get("access", {}).get(tg_key)
+        if access:
+            access["name"] = name
+            _save_registry(registry)
 
 
 def get_patient_name(patient_id: str) -> Optional[str]:
@@ -536,24 +589,67 @@ def get_patient_name(patient_id: str) -> Optional[str]:
 
 def add_patient_access(telegram_user_id: int, patient_id: str, role: str, user_name: str = None):
     """Grant a user access to a patient."""
-    registry = _load_registry()
-    tg_key = str(telegram_user_id)
-    if tg_key not in registry["access"]:
-        registry["access"][tg_key] = {
-            "name": user_name or "",
-            "patients": {},
-            "default_patient": patient_id,
-        }
-    registry["access"][tg_key]["patients"][patient_id] = role
-    if not registry["access"][tg_key].get("default_patient"):
-        registry["access"][tg_key]["default_patient"] = patient_id
-    _save_registry(registry)
+    with _registry_lock:
+        registry = _load_registry()
+        tg_key = str(telegram_user_id)
+        if tg_key not in registry["access"]:
+            registry["access"][tg_key] = {
+                "name": user_name or "",
+                "patients": {},
+                "default_patient": patient_id,
+            }
+        registry["access"][tg_key]["patients"][patient_id] = role
+        if not registry["access"][tg_key].get("default_patient"):
+            registry["access"][tg_key]["default_patient"] = patient_id
+        _save_registry(registry)
 
 
 def get_all_patients() -> dict:
     """Return all registered patients."""
     registry = _load_registry()
     return registry.get("patients", {})
+
+
+def delete_patient(owner_telegram_id: int, patient_id: str) -> bool:
+    """Delete ALL data for a patient. Only owner can delete. Returns True on success."""
+    import shutil
+
+    with _registry_lock:
+        registry = _load_registry()
+        patient = registry.get("patients", {}).get(patient_id)
+        if not patient:
+            return False
+
+        if patient.get("owner") != str(owner_telegram_id):
+            return False
+
+        # Remove from all users' access
+        for tg_id, access in registry.get("access", {}).items():
+            patients = access.get("patients", {})
+            patients.pop(patient_id, None)
+            if access.get("default_patient") == patient_id:
+                remaining = list(patients.keys())
+                access["default_patient"] = remaining[0] if remaining else None
+
+        # Remove patient record
+        del registry["patients"][patient_id]
+
+        # Remove pending invites for this patient
+        invites = registry.get("invites", {})
+        to_remove = [t for t, inv in invites.items() if inv.get("patient_id") == patient_id]
+        for t in to_remove:
+            del invites[t]
+
+        _save_registry(registry)
+
+    # Delete patient directory
+    patient_dir = get_patient_dir(patient_id)
+    if patient_dir.exists():
+        shutil.rmtree(patient_dir)
+
+    audit_log(owner_telegram_id, patient_id, "delete_patient", "GDPR forget")
+    logger.info("Patient '%s' deleted by owner %s (GDPR)", patient_id, owner_telegram_id)
+    return True
 
 
 def is_registered(telegram_user_id: int) -> bool:

@@ -1,7 +1,10 @@
 """Telegram bot interface for Mano — personal medical assistant."""
 
+import atexit
 import os
+import signal
 import tempfile
+import time
 import logging
 import subprocess
 from pathlib import Path
@@ -26,6 +29,7 @@ from src.audio_transcriber import (
     SUPPORTED_AUDIO,
 )
 from src.patient_manager import (
+    audit_log,
     get_patient_id_by_telegram,
     set_active_patient,
     get_accessible_patients,
@@ -69,9 +73,40 @@ BOT_NAME = os.getenv("TELEGRAM_BOT_NAME", "mano_med_bot")
 _pending_action: dict[int, dict] = {}
 
 # --- Multi-patient state ---
-# Each patient gets their own VectorStore + MedicalAgent, cached by patient_id
+# Each patient gets their own VectorStore + MedicalAgent, cached by patient_id with TTL
 _agents: dict[str, MedicalAgent] = {}
 _vector_stores: dict[str, VectorStore] = {}
+_agent_last_used: dict[str, float] = {}  # patient_id → timestamp
+_AGENT_TTL_SECONDS = 3600  # evict agents unused for 1 hour
+
+# --- Rate limiting ---
+_upload_counters: dict[int, list[float]] = {}  # user_id → list of upload timestamps
+_MAX_UPLOADS_PER_HOUR = 20
+
+
+def _evict_stale_agents():
+    """Remove agents and vector stores not used for AGENT_TTL_SECONDS."""
+    now = time.time()
+    stale = [pid for pid, ts in _agent_last_used.items() if now - ts > _AGENT_TTL_SECONDS]
+    for pid in stale:
+        _agents.pop(pid, None)
+        _vector_stores.pop(pid, None)
+        del _agent_last_used[pid]
+        logger.debug("Evicted agent for patient '%s' (idle)", pid)
+
+
+def _check_rate_limit(user_id: int) -> bool:
+    """Check if user is within upload rate limit. Returns True if allowed."""
+    now = time.time()
+    hour_ago = now - 3600
+    timestamps = _upload_counters.get(user_id, [])
+    # Remove old entries
+    timestamps = [t for t in timestamps if t > hour_ago]
+    _upload_counters[user_id] = timestamps
+    if len(timestamps) >= _MAX_UPLOADS_PER_HOUR:
+        return False
+    timestamps.append(now)
+    return True
 
 
 def _get_vector_store(patient_id: str) -> VectorStore:
@@ -83,10 +118,12 @@ def _get_vector_store(patient_id: str) -> VectorStore:
 
 
 def _get_agent(patient_id: str) -> MedicalAgent:
-    """Get or create a patient-specific MedicalAgent."""
+    """Get or create a patient-specific MedicalAgent with TTL tracking."""
+    _evict_stale_agents()
     if patient_id not in _agents:
         vs = _get_vector_store(patient_id)
         _agents[patient_id] = MedicalAgent(vector_store=vs, patient_id=patient_id)
+    _agent_last_used[patient_id] = time.time()
     return _agents[patient_id]
 
 
@@ -304,23 +341,46 @@ VISIT_ANALYSIS_PROMPT = """Это транскрипт аудиозаписи м
 {transcript}"""
 
 
-PRESCRIPTION_CHECK_PROMPT = """Пациентка прислала фото рецепта или медицинского назначения.
+def _build_prescription_check_prompt(patient_id: str, text: str) -> str:
+    """Build a dynamic prescription safety check prompt from patient profile."""
+    from src.patient_manager import load_profile, build_medical_summary
+
+    profile = load_profile(patient_id)
+    summary = build_medical_summary(patient_id) if profile else ""
+
+    # Build forbidden list
+    forbidden = []
+    if profile:
+        for a in profile.get("allergies", []):
+            entry = a["substance"]
+            if a.get("reaction"):
+                entry += f" — {a['reaction']}"
+            forbidden.append(entry)
+        for c in profile.get("contraindicated", []):
+            entry = c["substance"]
+            if c.get("reason"):
+                entry += f" — {c['reason']}"
+            forbidden.append(entry)
+
+    forbidden_block = ""
+    if forbidden:
+        forbidden_block = "\nЗАПРЕЩЁНО / АЛЛЕРГИИ:\n" + "\n".join(f"- {f}" for f in forbidden)
+
+    return f"""Пациент прислал фото рецепта или медицинского назначения.
 Распознанный текст ниже.
 
 ЗАДАЧА: Проверь КАЖДЫЙ препарат и процедуру из этого назначения на безопасность
-для ЭТОЙ КОНКРЕТНОЙ пациентки. Используй МЕДИЦИНСКУЮ СВОДКУ.
+для ЭТОГО КОНКРЕТНОГО пациента.
+
+МЕДИЦИНСКАЯ СВОДКА ПАЦИЕНТА:
+{summary or '(профиль не заполнен — проверь только общие взаимодействия)'}
+{forbidden_block}
 
 Проверяй:
 1. Есть ли препарат в списке запрещённых/аллергий?
-2. Совместимость с текущими лекарствами (дулоксетин, габапентин, холекальциферол, канефрон)
-3. Нагрузка на ЕДИНСТВЕННУЮ почку при рСКФ 32
-4. Нагрузка на печень (АЛТ 48)
-5. Взаимодействия с диагнозами (ХБП, ГЭРБ, остеопороз, тревожное расстройство)
-
-ОСОБОЕ ВНИМАНИЕ:
-- РЕНТГЕНКОНТРАСТ — ЗАПРЕЩЁН (единственная почка, рСКФ 32). Недавно делали КТ с контрастом → неделю не вставала с кровати.
-- НПВС — ЗАПРЕЩЕНЫ все
-- Любые нефротоксичные препараты
+2. Совместимость с текущими лекарствами пациента
+3. Взаимодействия с диагнозами пациента
+4. Нагрузка на органы с учётом анамнеза
 
 ФОРМАТ ОТВЕТА:
 Для каждого найденного препарата/процедуры:
@@ -685,6 +745,47 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ отключён.")
     else:
         await update.message.reply_text("Не удалось отключить доступ.")
+
+
+async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /forget — delete ALL data for the active patient (GDPR). Owner only."""
+    from src.patient_manager import delete_patient
+
+    user_id = update.effective_user.id
+    patient_id = _check_access(user_id)
+    if not patient_id:
+        return
+
+    if not is_owner(user_id, patient_id):
+        await update.message.reply_text("Только владелец профиля может удалить данные.")
+        return
+
+    patient_name = get_patient_name(patient_id) or patient_id
+
+    args = context.args
+    if not args or args[0] != "CONFIRM":
+        await update.message.reply_text(
+            f"Это НЕОБРАТИМО удалит ВСЕ данные пациента «{patient_name}»:\n"
+            "- Профиль, диагнозы, лекарства\n"
+            "- Дневник здоровья, анализы\n"
+            "- Все загруженные документы\n"
+            "- Историю переписки\n\n"
+            f"Для подтверждения: /forget CONFIRM"
+        )
+        return
+
+    # Evict cached agent/store
+    _agents.pop(patient_id, None)
+    _vector_stores.pop(patient_id, None)
+    _agent_last_used.pop(patient_id, None)
+
+    if delete_patient(user_id, patient_id):
+        await update.message.reply_text(
+            f"Все данные пациента «{patient_name}» удалены.\n"
+            "Используйте /start для создания нового профиля."
+        )
+    else:
+        await update.message.reply_text("Не удалось удалить данные. Проверьте, что вы владелец профиля.")
 
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1088,6 +1189,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not patient_id:
         return
 
+    if not _check_rate_limit(user_id):
+        await update.message.reply_text(f"Лимит загрузок: {_MAX_UPLOADS_PER_HOUR} в час. Попробуйте позже.")
+        return
+
     doc = update.message.document
     file_name = doc.file_name or "document"
     ext = Path(file_name).suffix.lower()
@@ -1120,6 +1225,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"file_name": file_name, "file_type": result["file_type"]},
         )
 
+        audit_log(user_id, patient_id, "upload_document", file_name)
         await update.message.reply_text(
             f"Готово! {file_name}: {chunks} фрагментов ({result['char_count']} символов) "
             f"добавлено в базу знаний."
@@ -1146,6 +1252,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     patient_id = _check_access(user_id)
     if not patient_id:
+        return
+
+    if not _check_rate_limit(user_id):
+        await update.message.reply_text(f"Лимит загрузок: {_MAX_UPLOADS_PER_HOUR} в час. Попробуйте позже.")
         return
 
     lang = _get_lang(patient_id)
@@ -1227,6 +1337,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not patient_id:
         return
 
+    if not _check_rate_limit(user_id):
+        await update.message.reply_text(f"Лимит загрузок: {_MAX_UPLOADS_PER_HOUR} в час. Попробуйте позже.")
+        return
+
     await update.message.reply_text("Обрабатываю фото (OCR)...")
 
     tmp_path = None
@@ -1246,6 +1360,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"file_name": file_name, "file_type": "image"},
         )
 
+        audit_log(user_id, patient_id, "upload_photo", file_name)
         preview = result["text"][:300]
         if len(result["text"]) > 300:
             preview += "..."
@@ -1286,7 +1401,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id, action="typing"
             )
             agent = _get_agent(patient_id)
-            check_prompt = PRESCRIPTION_CHECK_PROMPT.format(text=result["text"])
+            check_prompt = _build_prescription_check_prompt(patient_id, result["text"])
             sender = get_user_name(user_id) or update.effective_user.first_name
             answer = agent.ask(check_prompt, sender_telegram_id=user_id, sender_name=sender)
             if len(answer) <= 4096:
@@ -1327,6 +1442,7 @@ def main():
     app.add_handler(CommandHandler("invite", cmd_invite))
     app.add_handler(CommandHandler("access", cmd_access))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("forget", cmd_forget))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("labs", cmd_labs))
@@ -1343,6 +1459,25 @@ def main():
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Cleanup on shutdown
+    def _shutdown():
+        logger.info("Shutting down — clearing cached agents and vector stores...")
+        _agents.clear()
+        _vector_stores.clear()
+        _agent_last_used.clear()
+        # Clean up stale temp files
+        temp_dir = Path(tempfile.gettempdir())
+        for pattern in ("tmp*.ogg", "tmp*.jpg", "tmp*.pdf", "tmp*.mp3"):
+            for f in temp_dir.glob(pattern):
+                try:
+                    if f.stat().st_mtime < time.time() - 3600:
+                        f.unlink()
+                except OSError:
+                    pass
+        logger.info("Cleanup complete.")
+
+    atexit.register(_shutdown)
 
     logger.info("Bot started (multi-patient mode). Patients: %s", list(patients.keys()) if patients else "none")
     app.run_polling()

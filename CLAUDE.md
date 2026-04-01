@@ -105,6 +105,7 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 - **/invite [владелец]** — generate invite link (family or owner role)
 - **/access** — show who has access to current patient
 - **/revoke [id/name]** — owner removes someone's access
+- **/forget CONFIRM** — delete ALL patient data (GDPR, owner only)
 - **/switch [patient_id]** — switch active patient
 - **/sos** — emergency card for paramedics (dynamic from profile)
 - **/hospital** — full summary for ER admission
@@ -155,6 +156,18 @@ docker logs -f mano_bot
 ## Supported Languages
 - **ru** — Russian (full support)
 - **lt** — Lithuanian (interface, OCR, Whisper, prompts)
+
+## Security & Production Hardening
+- **File locking**: patient_registry.json uses `filelock` to prevent race conditions
+- **Atomic writes**: registry saves via temp file → backup → rename
+- **Patient ID validation**: only `[a-z0-9_-]` allowed, prevents path traversal
+- **TTL eviction**: cached agents auto-evicted after 1 hour of inactivity
+- **Rate limiting**: max 20 uploads/hour per user
+- **Audit log**: all access events logged to `data/audit.jsonl` (JSONL)
+- **GDPR /forget**: owner can delete ALL patient data irreversibly
+- **Graceful shutdown**: atexit cleans agents, vector stores, stale temp files
+- **Docker health check**: verifies registry readable every 60s
+- **Prescription check**: dynamic from patient profile (not hardcoded)
 
 ## Important Notes
 - All data is LOCAL per patient — nothing shared between patients

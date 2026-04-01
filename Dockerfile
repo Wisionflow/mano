@@ -28,4 +28,7 @@ VOLUME /app/data
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "from src.patient_manager import _load_registry; _load_registry(); print('ok')" || exit 1
+
 CMD ["python", "-X", "utf8", "telegram_bot.py"]
